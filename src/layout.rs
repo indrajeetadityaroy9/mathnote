@@ -17,37 +17,21 @@ pub(crate) fn split(area: Rect, focus: PaneFocus, zen_mode: bool) -> PaneAreas {
     if zen_mode || area.width < SINGLE_WIDTH || area.height < SINGLE_HEIGHT {
         return single(area, focus);
     }
-    if area.width < STACK_WIDTH {
-        return stacked(area, focus);
-    }
-    columned(area, focus)
-}
-
-fn columned(area: Rect, focus: PaneFocus) -> PaneAreas {
+    let direction = if area.width < STACK_WIDTH {
+        Direction::Vertical
+    } else {
+        Direction::Horizontal
+    };
     let (source, latex, preview) = constraints(focus);
-    let columns = Layout::default()
-        .direction(Direction::Horizontal)
+    let panes = Layout::default()
+        .direction(direction)
         .spacing(0)
         .constraints([source, latex, preview])
         .split(area);
     PaneAreas {
-        source: columns[0],
-        latex: columns[1],
-        preview: columns[2],
-    }
-}
-
-fn stacked(area: Rect, focus: PaneFocus) -> PaneAreas {
-    let (source, latex, preview) = constraints(focus);
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .spacing(0)
-        .constraints([source, latex, preview])
-        .split(area);
-    PaneAreas {
-        source: rows[0],
-        latex: rows[1],
-        preview: rows[2],
+        source: panes[0],
+        latex: panes[1],
+        preview: panes[2],
     }
 }
 

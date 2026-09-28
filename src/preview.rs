@@ -1,192 +1,213 @@
-//! In-memory PDF preview rendering for the live LaTeX pipeline.
+//! The live preview pipeline on one background thread of the editor: texpresso's driver.
 //!
-//! Public API summary:
-//! - [`page_count`] parses PDF bytes with Hayro and returns the number of pages.
-//! - [`rasterize_page`] renders one zero-based page to an opaque white RGBA [`image::DynamicImage`]
-//!   at a requested target width.
-//! - Errors are structured as [`PreviewError`].
-//!
-//! This module deliberately contains no ratatui or application UI state.
+//! The thread owns the snapshot engine ([`TexDriver`]), the incremental XDV document, the font
+//! store and SyncTeX. It receives each revision's LaTeX and the page the preview pane shows, and
+//! reports typesetting progress, rendered pages, and the SyncTeX index of every finished run.
 
-use std::fmt::{self, Display};
+use std::sync::{Arc, mpsc};
+use std::time::{Duration, Instant};
 
-use hayro::vello_cpu::color::palette::css::WHITE;
-use hayro::{
-    RenderCache, RenderSettings, hayro_interpret::InterpreterSettings, hayro_syntax::Pdf, render,
-};
-use image::{DynamicImage, ImageBuffer, Rgba};
+use image::RgbaImage;
 
-/// Metadata extracted from an in-memory PDF.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PdfInfo {
-    pub page_count: usize,
+use crate::app::LoopEvent;
+use crate::cache::{cache_is_warmed, default_cache_dir, ensure_cache_warm};
+use crate::driver::{DriverConfig, EngineState, TexDriver, TexMessage};
+use crate::dvi::{BundleFontFiles, FontStore, XdvDocument, render_page};
+use crate::synctex::SyncIndex;
+
+/// How long one engine step may serve queries before new commands are looked at.
+const ENGINE_STEP: Duration = Duration::from_millis(8);
+
+pub(crate) enum PreviewCommand {
+    /// The complete LaTeX source of a revision.
+    Document { revision: u64, source: String },
+    /// Keep `page` rendered at `width` pixels whenever its content changes.
+    View { page: usize, width: u32 },
 }
 
-/// Successful page render output.
-#[derive(Debug)]
-pub struct PagePreview {
-    pub page_index: usize,
-    pub width: u32,
-    pub height: u32,
-    pub image: DynamicImage,
-}
-
-/// Structured PDF preview failures.
-#[derive(Debug)]
-pub enum PreviewError {
-    EmptyPdf,
-    Parse {
-        message: String,
-    },
-    InvalidTargetWidth {
-        target_width: u32,
-    },
-    PageOutOfRange {
-        requested: usize,
-        page_count: usize,
-    },
-    DimensionsTooLarge {
-        width: u32,
-        height: u32,
-    },
-    ImageBufferSize {
-        width: u32,
-        height: u32,
-        byte_len: usize,
+pub(crate) enum PreviewEvent {
+    /// The local LaTeX resources are being prepared before the first run.
+    Preparing,
+    /// The pipeline cannot run at all.
+    Failed(String),
+    Page(RenderedPage),
+    /// The engine finished `revision`: its pages are final and its SyncTeX data is current.
+    Finished {
+        revision: u64,
+        pages: usize,
+        elapsed: Duration,
+        messages: Vec<TexMessage>,
+        sync: Option<Arc<SyncIndex>>,
     },
 }
 
-impl Display for PreviewError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::EmptyPdf => write!(f, "PDF buffer is empty"),
-            Self::Parse { message } => write!(f, "failed to parse PDF: {message}"),
-            Self::InvalidTargetWidth { target_width } => {
-                write!(
-                    f,
-                    "target width must be greater than zero, got {target_width}"
-                )
-            }
-            Self::PageOutOfRange {
-                requested,
-                page_count,
-            } => write!(
-                f,
-                "page index {requested} is out of range for {page_count} page(s)"
-            ),
-            Self::DimensionsTooLarge { width, height } => write!(
-                f,
-                "render dimensions {width}x{height} exceed Hayro's u16 viewport limit"
-            ),
-            Self::ImageBufferSize {
-                width,
-                height,
-                byte_len,
-            } => write!(
-                f,
-                "could not build RGBA image {width}x{height} from {byte_len} bytes"
-            ),
-        }
+/// One page rendered for the preview pane.
+#[derive(Clone)]
+pub(crate) struct RenderedPage {
+    pub index: usize,
+    /// Pages the document has so far.
+    pub pages: usize,
+    pub fingerprint: u64,
+    /// Pixels per big point.
+    pub scale: f32,
+    pub image: Arc<RgbaImage>,
+}
+
+pub(crate) fn preview_thread(
+    commands: mpsc::Receiver<PreviewCommand>,
+    events: mpsc::Sender<LoopEvent>,
+) {
+    let send = |event| events.send(LoopEvent::Preview(event)).is_ok();
+    let cache_dir = default_cache_dir();
+    if !cache_is_warmed() && !send(PreviewEvent::Preparing) {
+        return;
     }
-}
-
-impl std::error::Error for PreviewError {}
-
-/// Parse PDF bytes and return page metadata.
-pub fn inspect_pdf(pdf_bytes: &[u8]) -> Result<PdfInfo, PreviewError> {
-    let pdf = parse_pdf(pdf_bytes)?;
-    Ok(PdfInfo {
-        page_count: pdf.pages().len(),
-    })
-}
-
-/// Parse PDF bytes and return the number of pages.
-pub fn page_count(pdf_bytes: &[u8]) -> Result<usize, PreviewError> {
-    inspect_pdf(pdf_bytes).map(|info| info.page_count)
-}
-
-/// Rasterize a zero-based page to an opaque white RGBA image at `target_width` pixels.
-pub fn rasterize_page(
-    pdf_bytes: &[u8],
-    page_index: usize,
-    target_width: u32,
-) -> Result<PagePreview, PreviewError> {
-    if target_width == 0 {
-        return Err(PreviewError::InvalidTargetWidth { target_width });
-    }
-
-    let pdf = parse_pdf(pdf_bytes)?;
-    let pages = pdf.pages();
-    let page_count = pages.len();
-    let page = pages.get(page_index).ok_or(PreviewError::PageOutOfRange {
-        requested: page_index,
-        page_count,
-    })?;
-
-    let (native_width, native_height) = page.render_dimensions();
-    let scale = target_width as f32 / native_width.max(1.0);
-    let target_height = ((native_height * scale).round() as u32).max(1);
-
-    if target_width > u16::MAX as u32 || target_height > u16::MAX as u32 {
-        return Err(PreviewError::DimensionsTooLarge {
-            width: target_width,
-            height: target_height,
+    let setup = ensure_cache_warm(&cache_dir)
+        .map_err(|error| error.to_string())
+        .and_then(|()| BundleFontFiles::open(&cache_dir))
+        .and_then(|files| {
+            let engine_exe = std::env::current_exe().map_err(|error| error.to_string())?;
+            Ok((
+                TexDriver::new(DriverConfig {
+                    engine_exe,
+                    cache_dir: cache_dir.clone(),
+                }),
+                FontStore::new(Box::new(files)),
+            ))
         });
-    }
-
-    let cache = RenderCache::new();
-    let interpreter_settings = InterpreterSettings::default();
-    let render_settings = RenderSettings {
-        x_scale: scale,
-        y_scale: scale,
-        width: Some(target_width as u16),
-        height: Some(target_height as u16),
-        bg_color: WHITE,
+    let (driver, fonts) = match setup {
+        Ok(setup) => setup,
+        Err(message) => {
+            send(PreviewEvent::Failed(message));
+            return;
+        }
     };
 
-    let pixmap = render(page, &cache, &interpreter_settings, &render_settings);
-    let rgba = flatten_premultiplied_rgba_over_white(pixmap.data_as_u8_slice());
-    let width = u32::from(pixmap.width());
-    let height = u32::from(pixmap.height());
-    let byte_len = rgba.len();
-    let image = ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(width, height, rgba)
-        .map(DynamicImage::ImageRgba8)
-        .ok_or(PreviewError::ImageBufferSize {
-            width,
-            height,
-            byte_len,
-        })?;
-
-    Ok(PagePreview {
-        page_index,
-        width,
-        height,
-        image,
-    })
+    let mut pipeline = Pipeline {
+        events: &events,
+        driver,
+        fonts,
+        xdv: XdvDocument::new(),
+        revision: 0,
+        received: Instant::now(),
+        reported: None,
+        view: None,
+        rendered: None,
+    };
+    pipeline.run(&commands);
 }
 
-fn parse_pdf(pdf_bytes: &[u8]) -> Result<Pdf, PreviewError> {
-    if pdf_bytes.is_empty() {
-        return Err(PreviewError::EmptyPdf);
-    }
-
-    Pdf::new(pdf_bytes.to_vec()).map_err(|err| PreviewError::Parse {
-        message: format!("{err:?}"),
-    })
+struct Pipeline<'a> {
+    events: &'a mpsc::Sender<LoopEvent>,
+    driver: TexDriver,
+    fonts: FontStore,
+    xdv: XdvDocument,
+    /// Newest revision and when it arrived.
+    revision: u64,
+    received: Instant,
+    /// The revision whose finish was reported.
+    reported: Option<u64>,
+    /// Page and pixel width the pane shows.
+    view: Option<(usize, u32)>,
+    /// What was last rendered for the view: page, width, fingerprint.
+    rendered: Option<(usize, u32, u64)>,
 }
 
-fn flatten_premultiplied_rgba_over_white(bytes: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(bytes.len());
+impl Pipeline<'_> {
+    fn run(&mut self, commands: &mpsc::Receiver<PreviewCommand>) {
+        loop {
+            let running = self.driver.state() == EngineState::Running;
+            let command = if running {
+                commands.try_recv().ok()
+            } else {
+                match commands.recv() {
+                    Ok(command) => Some(command),
+                    Err(_) => return,
+                }
+            };
+            if let Some(command) = command {
+                self.handle(command);
+                while let Ok(command) = commands.try_recv() {
+                    self.handle(command);
+                }
+            }
 
-    for pixel in bytes.as_chunks::<4>().0 {
-        let alpha = u16::from(pixel[3]);
-        let inverse_alpha = 255_u16.saturating_sub(alpha);
-
-        out.push((u16::from(pixel[0]) + inverse_alpha).min(255) as u8);
-        out.push((u16::from(pixel[1]) + inverse_alpha).min(255) as u8);
-        out.push((u16::from(pixel[2]) + inverse_alpha).min(255) as u8);
-        out.push(255);
+            if self.driver.state() == EngineState::Running && self.driver.step(ENGINE_STEP) {
+                self.update_pages();
+            }
+            if !self.render_view() || !self.report_finish() {
+                return;
+            }
+        }
     }
 
-    out
+    fn handle(&mut self, command: PreviewCommand) {
+        match command {
+            PreviewCommand::Document { revision, source } => {
+                self.revision = revision;
+                self.received = Instant::now();
+                self.driver.set_document(source.as_bytes());
+                self.update_pages();
+            }
+            PreviewCommand::View { page, width } => self.view = Some((page, width)),
+        }
+    }
+
+    fn update_pages(&mut self) {
+        let truncated = self.driver.take_xdv_truncation();
+        self.xdv.update(self.driver.xdv(), truncated);
+    }
+
+    /// Render the viewed page when it or the view changed; `false` once the editor is gone.
+    fn render_view(&mut self) -> bool {
+        let Some((index, width)) = self.view else {
+            return true;
+        };
+        let Some(page) = self.xdv.page(index) else {
+            return true;
+        };
+        if self.rendered == Some((index, width, page.fingerprint)) || width == 0 {
+            return true;
+        }
+        self.rendered = Some((index, width, page.fingerprint));
+        let scale = width as f32 / page.width;
+        let image = render_page(page, &mut self.fonts, scale);
+        let rendered = RenderedPage {
+            index,
+            pages: self.xdv.page_count(),
+            fingerprint: page.fingerprint,
+            scale,
+            image: Arc::new(image),
+        };
+        self.events
+            .send(LoopEvent::Preview(PreviewEvent::Page(rendered)))
+            .is_ok()
+    }
+
+    /// Report the newest revision once the engine has finished it.
+    fn report_finish(&mut self) -> bool {
+        if self.driver.state() != EngineState::Finished || self.reported == Some(self.revision) {
+            return true;
+        }
+        self.update_pages();
+        // The finished run may have changed the viewed page after its last render.
+        if !self.render_view() {
+            return false;
+        }
+        self.reported = Some(self.revision);
+        let sync = self
+            .driver
+            .synctex_gz()
+            .and_then(|bytes| SyncIndex::from_gzip(bytes).ok())
+            .map(Arc::new);
+        self.events
+            .send(LoopEvent::Preview(PreviewEvent::Finished {
+                revision: self.revision,
+                pages: self.xdv.page_count(),
+                elapsed: self.received.elapsed(),
+                messages: self.driver.messages(),
+                sync,
+            }))
+            .is_ok()
+    }
 }

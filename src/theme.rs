@@ -44,6 +44,16 @@ impl Default for Theme {
     }
 }
 
+impl Theme {
+    /// The accent colour's RGB components, when it is an RGB colour.
+    pub(crate) fn accent_rgb(&self) -> Option<[u8; 3]> {
+        match self.accent {
+            Color::Rgb(red, green, blue) => Some([red, green, blue]),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

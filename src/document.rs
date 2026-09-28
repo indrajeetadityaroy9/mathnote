@@ -53,6 +53,17 @@ impl TextBuffer {
         self.cursor
     }
 
+    /// The cursor as a UTF-8 byte offset into [`Self::text`].
+    pub fn cursor_byte(&self) -> usize {
+        self.rope.char_to_byte(self.cursor)
+    }
+
+    /// Move the cursor to the character containing `byte` (clamped to the end of the text).
+    pub fn set_cursor_byte(&mut self, byte: usize) {
+        self.cursor = self.rope.byte_to_char(byte.min(self.rope.len_bytes()));
+        self.preferred_column = None;
+    }
+
     pub fn len_lines(&self) -> usize {
         self.rope.len_lines()
     }
@@ -182,6 +193,39 @@ impl TextBuffer {
             len -= 1;
         }
         len
+    }
+}
+
+/// Map a byte offset in `from` to the matching offset in `to`, where the texts differ by one
+/// replaced region: their longest common prefix and suffix correspond byte for byte, and any
+/// offset inside the replaced region maps to the region's start in `to`.
+pub fn map_offset_across_edit(from: &str, to: &str, byte: usize) -> usize {
+    let byte = byte.min(from.len());
+    let mut prefix = from
+        .bytes()
+        .zip(to.bytes())
+        .take_while(|(left, right)| left == right)
+        .count();
+    while !from.is_char_boundary(prefix) || !to.is_char_boundary(prefix) {
+        prefix -= 1;
+    }
+    let mut suffix = from
+        .bytes()
+        .rev()
+        .zip(to.bytes().rev())
+        .take(from.len().min(to.len()) - prefix)
+        .take_while(|(left, right)| left == right)
+        .count();
+    while !from.is_char_boundary(from.len() - suffix) || !to.is_char_boundary(to.len() - suffix) {
+        suffix -= 1;
+    }
+
+    if byte <= prefix {
+        byte
+    } else if byte >= from.len() - suffix {
+        byte + to.len() - from.len()
+    } else {
+        prefix
     }
 }
 

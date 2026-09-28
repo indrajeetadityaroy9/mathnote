@@ -2749,17 +2749,24 @@ dependencies = [
 name = "mathnote"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "color-eyre",
  "crossterm",
  "directories",
+ "flate2",
  "hayro",
  "image",
+ "kurbo",
+ "nix 0.31.3",
  "ratatui",
  "ratatui-image",
  "ropey",
+ "skrifa",
  "tectonic",
+ "tectonic_bridge_core",
  "tectonic_bundles",
  "unicode-width 0.2.2",
+ "vello_cpu",
 ]
 
 [[package]]
@@ -2953,6 +2960,7 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
+ "memoffset",
 ]
 
 [[package]]
@@ -3890,11 +3898,12 @@ dependencies = [
 
 [[package]]
 name = "ratatui-image"
-version = "11.0.8"
+version = "11.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "399baa06251282b0c1bbb5762848cf98a6b7b84f44af7f0daf3213ace16df4f0"
+checksum = "9593d10c61ec2007f429d1fafc4f4a19fecdbae4d06b531a2d505227fb82f5ea"
 dependencies = [
  "base64-simd",
+ "flate2",
  "icy_sixel",
  "image",
  "rand 0.8.8",
@@ -6054,9 +6063,9 @@ dependencies = [
 
 [[package]]
 name = "wide"
-version = "1.7.0"
+version = "1.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8cf05ca94c9fba0c51316899caa1d1e74a064fc310a5efa7375e614343d415be"
+checksum = "d920ac99c3c8edce110cb8d07dbb324d6d026011dce85b1e9355b70f0adacc4f"
 dependencies = [
  "bytemuck",
  "safe_arch",

@@ -6,20 +6,30 @@ description = "A local-first terminal notebook for natural-language mathematics 
 license = "MIT"
 
 [dependencies]
+base64 = "0.22"
 color-eyre = "0.6"
 crossterm = "0.29"
 directories = "6.0"
-hayro = "0.7.1"
-image = { version = "0.25", default-features = false, features = ["png"] }
+flate2 = "1"
+image = { version = "0.25", default-features = false }
+kurbo = "0.13"
+nix = { version = "0.31", features = ["socket", "process", "signal", "uio", "fs", "poll"] }
 ratatui = "0.30"
 ratatui-image = { version = "11.0.8", default-features = false, features = ["crossterm", "image-defaults"] }
 ropey = "1.6.1"
+skrifa = "0.42.1"
 tectonic = { version = "0.17.0", default-features = false, features = ["geturl-reqwest"] }
+tectonic_bridge_core = "0.5.3"
 tectonic_bundles = { version = "0.4.2", default-features = false, features = ["geturl-reqwest"] }
 unicode-width = "0.2"
+vello_cpu = { version = "0.0.8", default-features = false, features = ["std", "u8_pipeline"] }
 
 [profile.dev]
 opt-level = 1
 
 [profile.dev.package."*"]
 opt-level = 3
+
+[dev-dependencies]
+hayro = "0.7.1"
+

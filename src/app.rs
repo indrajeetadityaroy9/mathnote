@@ -1,37 +1,52 @@
+use std::collections::BTreeMap;
 use std::io;
+use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
     MouseEventKind,
 };
-use image::{DynamicImage, ImageBuffer, Rgba, imageops};
+use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
+use crossterm::{execute, queue};
+use image::{ImageBuffer, Rgba, RgbaImage, imageops};
 use ratatui::DefaultTerminal;
-use ratatui::layout::{Rect, Size};
-use ratatui_image::errors::Errors as ImageError;
+use ratatui::buffer::Buffer;
+use ratatui::layout::{Position, Rect, Size};
 use ratatui_image::picker::Picker;
-use ratatui_image::thread::{ResizeRequest, ResizeResponse, ThreadProtocol};
-use ratatui_image::{Resize, ResizeEncodeRender};
 
-use crate::compiler::{
-    CompileError, CompileRequest, DiagnosticKind, cache_is_warmed, compile_latex,
-};
-use crate::document::{Document, SourceSpan, TextBuffer};
+use crate::document::{Document, SourceSpan, TextBuffer, map_offset_across_edit};
 use crate::latex::{LatexDocument, emit_latex};
-use crate::preview::{inspect_pdf, rasterize_page};
+use crate::preview::{PreviewCommand, PreviewEvent, RenderedPage, preview_thread};
+use crate::strips::{EncodedStrips, StripPreview};
+use crate::synctex::{SyncIndex, SyncTarget};
+use crate::theme::Theme;
 use crate::ui;
+use crate::worker::{BuildRequest, WorkerEvent, build_worker};
 
-const ACTIVE_POLL_INTERVAL: Duration = Duration::from_millis(16);
-const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SPINNER_INTERVAL: Duration = Duration::from_millis(80);
-const COMPILE_DEBOUNCE: Duration = Duration::from_millis(120);
-const DEFAULT_RASTER_WIDTH: u32 = 800;
 const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
-type PreviewViewportKey = (Option<u64>, usize, u32, u16, u16, u16);
+/// Everything that determines the terminal image of the preview pane. An unchanged key means
+/// nothing is re-encoded.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PreviewViewport {
+    fingerprint: u64,
+    page_index: usize,
+    image_width: u32,
+    pane_width: u16,
+    pane_height: u16,
+    crop_y: u32,
+    /// Pixels per big point of the page image.
+    scale: f32,
+    highlight: Option<(u32, u32)>,
+}
 
+/// The editor: the note, its generated LaTeX, and the live preview of the typeset page. The
+/// typesetting pipeline (texpresso's driver) runs on a background thread.
 pub struct App {
     buffer: TextBuffer,
     should_quit: bool,
@@ -41,10 +56,11 @@ pub struct App {
     revision: u64,
     generated_revision: Option<u64>,
     generated: Option<LatexDocument>,
-    last_edit: Instant,
     submitted_revision: Option<u64>,
-    worker_tx: mpsc::Sender<WorkerRequest>,
-    worker_rx: mpsc::Receiver<WorkerEvent>,
+    worker_tx: mpsc::Sender<BuildRequest>,
+    events_tx: mpsc::Sender<LoopEvent>,
+    events_rx: mpsc::Receiver<LoopEvent>,
+    terminal_error: Option<io::Error>,
     status: PipelineStatus,
     diagnostic_span: Option<SourceSpan>,
     spinner_frame: usize,
@@ -52,21 +68,25 @@ pub struct App {
     source_characters: usize,
     source_words: usize,
 
-    picker: Picker,
-    active_image: ImageSlot,
-    staging_image: ImageSlot,
-    staging_preview: bool,
-    preview_visible: bool,
-    active_preview_key: Option<PreviewViewportKey>,
-    staging_preview_key: Option<PreviewViewportKey>,
-    pdf: Option<Arc<Vec<u8>>>,
-    pdf_revision: Option<u64>,
+    pipeline: PipelineLink,
+    /// Documents sent to the pipeline by revision, kept until a newer one has been typeset.
+    sent: BTreeMap<u64, LatexDocument>,
+    /// The newest revision the pipeline finished; `sync` belongs to it.
+    typeset_revision: Option<u64>,
+    sync: Option<Arc<SyncIndex>>,
     page_count: usize,
     page_index: usize,
-    full_page: Option<DynamicImage>,
-    full_page_revision: Option<u64>,
-    full_page_width: u32,
-    requested_raster: Option<(u64, usize, u32)>,
+    /// The rendered image of `page_index`, when it has arrived.
+    page: Option<RenderedPage>,
+    requested_view: Option<(usize, u32)>,
+    picker: Picker,
+    strips: StripPreview<PreviewViewport>,
+    /// Typeset extent of the cursor's note line.
+    sync_target: Option<SyncTarget>,
+    /// `sync_target` in page image pixel rows `[top, bottom)`.
+    highlight: Option<(u32, u32)>,
+    /// Terminal cell of the editing caret for the frame being drawn.
+    caret: Option<Position>,
 
     source_size: Size,
     source_scroll_y: usize,
@@ -109,101 +129,81 @@ impl PaneFocus {
 enum PipelineStatus {
     Empty,
     Waiting,
-    Compiling { bootstrap: bool },
-    Rasterizing,
+    Preparing,
+    Typesetting,
     Ready { elapsed: Duration, warnings: usize },
     Error(String),
 }
 
-enum WorkerRequest {
-    Compile {
-        revision: u64,
-        source: String,
-        page_index: usize,
-        target_width: u32,
-    },
-    Raster {
-        revision: u64,
-        pdf: Arc<Vec<u8>>,
-        page_index: usize,
-        target_width: u32,
-    },
+/// Everything that can wake the UI loop, delivered through one channel.
+pub(crate) enum LoopEvent {
+    Terminal(Event),
+    TerminalFailed(io::Error),
+    Worker(WorkerEvent),
+    Preview(PreviewEvent),
+    PreviewEncoded(EncodedStrips),
 }
 
-enum WorkerEvent {
-    Built {
-        revision: u64,
-        document: LatexDocument,
-        words: usize,
-    },
-    Ready {
-        revision: u64,
-        pdf: Arc<Vec<u8>>,
-        page_count: usize,
-        page_index: usize,
-        image: DynamicImage,
-        width: u32,
-        elapsed: Duration,
-        warnings: usize,
-    },
-    RasterReady {
-        revision: u64,
-        page_index: usize,
-        image: DynamicImage,
-        width: u32,
-    },
-    Failed {
-        revision: u64,
-        message: String,
-        tex_line: Option<usize>,
-    },
-    ParseFailed {
-        revision: u64,
-        message: String,
-        byte: usize,
-    },
+/// Where revisions and views go.
+enum PipelineLink {
+    /// No typesetting: unit tests.
+    Detached,
+    Thread(mpsc::Sender<PreviewCommand>),
+    /// Records what would be sent, for tests.
+    #[cfg(test)]
+    Recording(Vec<PreviewCommand>),
 }
 
-struct ImageSlot {
-    protocol: ThreadProtocol,
-    resize_rx: mpsc::Receiver<Result<ResizeResponse, ImageError>>,
-}
-
-impl ImageSlot {
-    fn new() -> Self {
-        let (resize_tx, resize_requests) = mpsc::channel::<ResizeRequest>();
-        let (resize_events, resize_rx) = mpsc::channel();
-        thread::spawn(move || {
-            while let Ok(request) = resize_requests.recv() {
-                if resize_events.send(request.resize_encode()).is_err() {
-                    break;
-                }
+impl PipelineLink {
+    fn send(&mut self, command: PreviewCommand) {
+        match self {
+            Self::Detached => {}
+            Self::Thread(commands) => {
+                let _ = commands.send(command);
             }
-        });
-        Self {
-            protocol: ThreadProtocol::new(resize_tx, None),
-            resize_rx,
+            #[cfg(test)]
+            Self::Recording(sent) => sent.push(command),
         }
     }
 }
 
 impl Default for App {
+    /// An editor without a typesetting pipeline.
     fn default() -> Self {
-        Self::new(Picker::halfblocks())
+        Self::with_pipeline(Picker::halfblocks(), |_| PipelineLink::Detached)
     }
 }
 
 impl App {
-    pub fn new(mut picker: Picker) -> Self {
+    /// An editor with its typesetting pipeline, drawing pages through `picker`'s protocol.
+    pub fn new(picker: Picker) -> Self {
+        Self::with_pipeline(picker, |events| {
+            let (commands_tx, commands) = mpsc::channel();
+            let events = events.clone();
+            thread::spawn(move || preview_thread(commands, events));
+            PipelineLink::Thread(commands_tx)
+        })
+    }
+
+    fn with_pipeline(
+        mut picker: Picker,
+        pipeline: impl FnOnce(&mpsc::Sender<LoopEvent>) -> PipelineLink,
+    ) -> Self {
         picker.set_background_color(Some(Rgba([255, 255, 255, 255])));
-
         let (worker_tx, worker_requests) = mpsc::channel();
-        let (worker_events, worker_rx) = mpsc::channel();
-        thread::spawn(move || pipeline_worker(worker_requests, worker_events));
+        let (events_tx, events_rx) = mpsc::channel();
+        let worker_events = events_tx.clone();
+        thread::spawn(move || build_worker(worker_requests, worker_events));
+        let encoded_events = events_tx.clone();
+        let strips = StripPreview::new(picker.clone(), move |encoded| {
+            encoded_events
+                .send(LoopEvent::PreviewEncoded(encoded))
+                .is_ok()
+        });
+        let pipeline = pipeline(&events_tx);
 
-        let buffer = TextBuffer::default();
         let mut app = Self {
-            buffer,
+            buffer: TextBuffer::default(),
             should_quit: false,
             show_help: false,
             zen_mode: false,
@@ -211,37 +211,36 @@ impl App {
             revision: 1,
             generated_revision: None,
             generated: None,
-            last_edit: Instant::now() - COMPILE_DEBOUNCE,
             submitted_revision: None,
             worker_tx,
-            worker_rx,
+            events_tx,
+            events_rx,
+            terminal_error: None,
             status: PipelineStatus::Waiting,
             diagnostic_span: None,
             spinner_frame: 0,
             last_spinner_tick: Instant::now(),
             source_characters: 0,
             source_words: 0,
-            picker,
-            active_image: ImageSlot::new(),
-            staging_image: ImageSlot::new(),
-            staging_preview: false,
-            preview_visible: false,
-            active_preview_key: None,
-            staging_preview_key: None,
-            pdf: None,
-            pdf_revision: None,
+            pipeline,
+            sent: BTreeMap::new(),
+            typeset_revision: None,
+            sync: None,
             page_count: 0,
             page_index: 0,
-            full_page: None,
-            full_page_revision: None,
-            full_page_width: 0,
-            requested_raster: None,
+            page: None,
+            requested_view: None,
+            picker,
+            strips,
+            sync_target: None,
+            highlight: None,
+            caret: None,
             source_size: Size::default(),
             source_scroll_y: 0,
             source_scroll_x: 0,
             latex_size: Size::default(),
             latex_scroll_rows: 0,
-            preview_size: Size::new(80, 24),
+            preview_size: Size::default(),
             preview_scroll_rows: 0,
             source_area: Rect::default(),
             latex_area: Rect::default(),
@@ -252,42 +251,99 @@ impl App {
     }
 
     pub fn run(mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
+        spawn_terminal_reader(self.events_tx.clone());
         let mut needs_draw = true;
         while !self.should_quit {
-            needs_draw |= self.process_background_events();
-            needs_draw |= self.maybe_submit_compile();
-            needs_draw |= self.maybe_submit_raster();
-            needs_draw |= self.advance_spinner();
-
+            needs_draw |= self.maybe_submit_build();
             if needs_draw {
-                terminal.draw(|frame| ui::render(frame, &mut self))?;
+                self.draw(terminal)?;
                 needs_draw = false;
-
-                needs_draw |= self.maybe_submit_compile();
-                needs_draw |= self.maybe_submit_raster();
             }
 
-            if event::poll(self.poll_interval())? {
-                match event::read()? {
-                    Event::Key(key) => {
-                        self.handle_key(key);
-                        needs_draw = true;
-                    }
-                    Event::Paste(text) => {
-                        self.buffer.insert_str(&text);
-                        self.mark_edited();
-                        needs_draw = true;
-                    }
-                    Event::Mouse(mouse) => {
-                        self.handle_mouse(mouse);
-                        needs_draw = true;
-                    }
-                    Event::Resize(_, _) => needs_draw = true,
-                    _ => {}
+            let event = if self.pipeline_is_active() {
+                match self.events_rx.recv_timeout(SPINNER_INTERVAL) {
+                    Ok(event) => Some(event),
+                    Err(RecvTimeoutError::Timeout) => None,
+                    Err(RecvTimeoutError::Disconnected) => return Ok(()),
                 }
+            } else {
+                match self.events_rx.recv() {
+                    Ok(event) => Some(event),
+                    Err(_) => return Ok(()),
+                }
+            };
+            if let Some(event) = event {
+                needs_draw |= self.handle_loop_event(event);
+            }
+            needs_draw |= self.process_background_events();
+            needs_draw |= self.advance_spinner();
+            if let Some(error) = self.terminal_error.take() {
+                return Err(error);
             }
         }
         Ok(())
+    }
+
+    /// Draw one frame as a single synchronized update with the caret hidden while cells are
+    /// written, then place and show it. Ratatui would otherwise show the caret before moving it,
+    /// so each frame briefly flashed it at the last cell written.
+    fn draw(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
+        queue!(terminal.backend_mut(), BeginSynchronizedUpdate, Hide)?;
+        terminal.draw(|frame| ui::render(frame, self))?;
+        if let Some(caret) = self.caret {
+            queue!(terminal.backend_mut(), MoveTo(caret.x, caret.y), Show)?;
+        }
+        execute!(terminal.backend_mut(), EndSynchronizedUpdate)
+    }
+
+    pub(crate) fn handle_event(&mut self, event: Event) -> bool {
+        let before = (self.revision, self.buffer.cursor());
+        let redraw = match event {
+            Event::Key(key) => {
+                self.handle_key(key);
+                true
+            }
+            Event::Paste(text) => {
+                self.buffer.insert_str(&text);
+                self.mark_edited();
+                true
+            }
+            Event::Mouse(mouse) => {
+                self.handle_mouse(mouse);
+                true
+            }
+            Event::Resize(_, _) => true,
+            _ => false,
+        };
+        if (self.revision, self.buffer.cursor()) != before {
+            self.follow_cursor();
+        }
+        redraw
+    }
+
+    fn handle_loop_event(&mut self, event: LoopEvent) -> bool {
+        match event {
+            LoopEvent::Terminal(event) => self.handle_event(event),
+            LoopEvent::TerminalFailed(error) => {
+                self.terminal_error = Some(error);
+                true
+            }
+            LoopEvent::Worker(event) => {
+                self.handle_worker_event(event);
+                true
+            }
+            LoopEvent::Preview(event) => {
+                self.handle_preview_event(event);
+                true
+            }
+            LoopEvent::PreviewEncoded(encoded) => match self.strips.accept(encoded) {
+                Ok(changed) => changed,
+                Err(error) => {
+                    self.status = PipelineStatus::Error(format!("terminal image error: {error}"));
+                    true
+                }
+            },
+        }
     }
 
     pub(crate) fn handle_key(&mut self, key: KeyEvent) {
@@ -408,6 +464,7 @@ impl App {
         }
     }
 
+    /// Keys of the LaTeX and preview inspector panes.
     fn handle_browse_key(&mut self, key: KeyEvent) -> bool {
         let plain_character = |expected| {
             key.code == KeyCode::Char(expected)
@@ -431,91 +488,38 @@ impl App {
             return true;
         }
 
+        let up = key.code == KeyCode::Up || plain_character('k');
+        let down = key.code == KeyCode::Down || plain_character('j');
         match self.focus {
-            PaneFocus::Source => false,
-            PaneFocus::Latex => match key.code {
-                KeyCode::Up if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.scroll_latex(-1);
-                    true
+            PaneFocus::Source => return false,
+            PaneFocus::Latex => {
+                let page = i16::try_from(self.latex_size.height.max(1)).unwrap_or(i16::MAX);
+                match key.code {
+                    _ if up => self.scroll_latex(-1),
+                    _ if down => self.scroll_latex(1),
+                    KeyCode::PageUp => self.scroll_latex(-page),
+                    KeyCode::PageDown => self.scroll_latex(page),
+                    KeyCode::Home => self.latex_scroll_rows = 0,
+                    KeyCode::End => self.latex_scroll_rows = self.max_latex_scroll(),
+                    _ => return false,
                 }
-                KeyCode::Down if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.scroll_latex(1);
-                    true
-                }
-                KeyCode::PageUp => {
-                    self.scroll_latex(
-                        -i16::try_from(self.latex_size.height.max(1)).unwrap_or(i16::MAX),
-                    );
-                    true
-                }
-                KeyCode::PageDown => {
-                    self.scroll_latex(
-                        i16::try_from(self.latex_size.height.max(1)).unwrap_or(i16::MAX),
-                    );
-                    true
-                }
-                KeyCode::Home => {
-                    self.latex_scroll_rows = 0;
-                    true
-                }
-                KeyCode::End => {
-                    self.latex_scroll_rows = self.max_latex_scroll();
-                    true
-                }
-                KeyCode::Char('k') if plain_character('k') => {
-                    self.scroll_latex(-1);
-                    true
-                }
-                KeyCode::Char('j') if plain_character('j') => {
-                    self.scroll_latex(1);
-                    true
-                }
-                _ => false,
-            },
+            }
             PaneFocus::Preview => match key.code {
-                KeyCode::Up if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.scroll_preview(-1);
-                    true
-                }
-                KeyCode::Down if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.scroll_preview(1);
-                    true
-                }
-                KeyCode::Char('k') if plain_character('k') => {
-                    self.scroll_preview(-1);
-                    true
-                }
-                KeyCode::Char('j') if plain_character('j') => {
-                    self.scroll_preview(1);
-                    true
-                }
-                KeyCode::PageUp => {
-                    self.change_page(-1);
-                    true
-                }
-                KeyCode::PageDown => {
-                    self.change_page(1);
-                    true
-                }
-                KeyCode::Home => {
-                    self.preview_scroll_rows = 0;
-                    self.install_visible_preview();
-                    true
-                }
-                KeyCode::End => {
-                    self.scroll_preview(i16::MAX);
-                    true
-                }
-                _ => false,
+                _ if up => self.scroll_preview(-1),
+                _ if down => self.scroll_preview(1),
+                KeyCode::PageUp => self.change_page(-1),
+                KeyCode::PageDown => self.change_page(1),
+                KeyCode::Home => self.scroll_preview(i16::MIN),
+                KeyCode::End => self.scroll_preview(i16::MAX),
+                _ => return false,
             },
         }
+        true
     }
 
     fn mark_edited(&mut self) {
         self.revision = self.revision.wrapping_add(1);
-        self.last_edit = Instant::now();
         self.submitted_revision = None;
-        self.requested_raster = None;
         self.diagnostic_span = None;
         self.refresh_source_state();
         self.ensure_cursor_visible();
@@ -523,276 +527,338 @@ impl App {
 
     fn refresh_source_state(&mut self) {
         self.source_characters = self.buffer.len_chars();
+        self.diagnostic_span = None;
         if self.buffer.is_blank() {
             self.source_words = 0;
-            self.generated = Document::parse("")
-                .ok()
-                .map(|document| emit_latex(&document));
-            self.generated_revision = Some(self.revision);
             self.latex_scroll_rows = 0;
-            self.pdf = None;
-            self.pdf_revision = None;
-            self.page_count = 0;
-            self.page_index = 0;
-            self.full_page = None;
-            self.full_page_revision = None;
-            self.full_page_width = 0;
-            self.requested_raster = None;
-            self.active_image.protocol.empty_protocol();
-            self.staging_image.protocol.empty_protocol();
-            self.staging_preview = false;
-            self.preview_visible = false;
-            self.active_preview_key = None;
-            self.staging_preview_key = None;
+            self.submitted_revision = Some(self.revision);
             self.status = PipelineStatus::Empty;
-            self.diagnostic_span = None;
+            if let Ok(document) = Document::parse("") {
+                self.accept_built(self.revision, emit_latex(&document));
+            }
             return;
         }
         self.generated_revision = None;
         self.status = PipelineStatus::Waiting;
-        self.diagnostic_span = None;
     }
 
-    fn maybe_submit_compile(&mut self) -> bool {
-        if matches!(self.status, PipelineStatus::Empty)
-            || self.submitted_revision == Some(self.revision)
-            || self.last_edit.elapsed() < COMPILE_DEBOUNCE
-        {
+    fn maybe_submit_build(&mut self) -> bool {
+        if self.submitted_revision == Some(self.revision) {
             return false;
         }
-
-        let target_width = self.target_raster_width();
-        let request = WorkerRequest::Compile {
+        let request = BuildRequest {
             revision: self.revision,
             source: self.buffer.text(),
-            page_index: 0,
-            target_width,
         };
         if self.worker_tx.send(request).is_ok() {
             self.submitted_revision = Some(self.revision);
-            self.status = PipelineStatus::Compiling {
-                bootstrap: !cache_is_warmed(),
-            };
         } else {
-            self.status = PipelineStatus::Error(String::from("preview worker stopped"));
+            self.status = PipelineStatus::Error(String::from("note worker stopped"));
         }
         true
     }
 
-    fn maybe_submit_raster(&mut self) -> bool {
-        let Some(pdf) = &self.pdf else {
-            return false;
-        };
-        if self.pdf_revision != Some(self.revision) {
-            return false;
-        }
-        let target_width = self.target_raster_width();
-        let key = (self.revision, self.page_index, target_width);
-        if self.requested_raster == Some(key)
-            || (self.full_page_width == target_width && self.full_page.is_some())
-        {
-            return false;
-        }
-
-        if self
-            .worker_tx
-            .send(WorkerRequest::Raster {
-                revision: self.revision,
-                pdf: Arc::clone(pdf),
-                page_index: self.page_index,
-                target_width,
-            })
-            .is_ok()
-        {
-            self.requested_raster = Some(key);
-            self.status = PipelineStatus::Rasterizing;
-            true
-        } else {
-            false
-        }
-    }
-
-    fn process_background_events(&mut self) -> bool {
+    pub(crate) fn process_background_events(&mut self) -> bool {
         let mut changed = false;
-        while let Ok(result) = self.active_image.resize_rx.try_recv() {
-            changed = true;
-            match result {
-                Ok(response) => {
-                    self.active_image.protocol.update_resized_protocol(response);
-                }
-                Err(error) if self.preview_visible => {
-                    self.status = PipelineStatus::Error(format!("terminal image error: {error}"));
-                }
-                Err(_) => {}
-            }
-        }
-
-        while let Ok(result) = self.staging_image.resize_rx.try_recv() {
-            changed = true;
-            match result {
-                Ok(response) => {
-                    if self
-                        .staging_image
-                        .protocol
-                        .update_resized_protocol(response)
-                        && self.staging_preview
-                    {
-                        std::mem::swap(&mut self.active_image, &mut self.staging_image);
-                        self.staging_preview = false;
-                        self.preview_visible = true;
-                        self.active_preview_key = self.staging_preview_key.take();
-                    }
-                }
-                Err(error) => {
-                    let was_staging = self.staging_preview;
-                    self.staging_preview = false;
-                    self.staging_preview_key = None;
-                    if was_staging {
-                        self.status =
-                            PipelineStatus::Error(format!("terminal image error: {error}"));
-                    }
-                }
-            }
-        }
-
-        while let Ok(event) = self.worker_rx.try_recv() {
-            changed = true;
-            match event {
-                WorkerEvent::Built {
-                    revision,
-                    document,
-                    words,
-                } if revision == self.revision => {
-                    self.generated = Some(document);
-                    self.generated_revision = Some(revision);
-                    self.source_words = words;
-                    self.latex_scroll_rows = 0;
-                    self.diagnostic_span = None;
-                }
-                WorkerEvent::Ready {
-                    revision,
-                    pdf,
-                    page_count,
-                    page_index,
-                    image,
-                    width,
-                    elapsed,
-                    warnings,
-                } if revision == self.revision => {
-                    self.pdf = Some(pdf);
-                    self.pdf_revision = Some(revision);
-                    self.page_count = page_count;
-                    self.page_index = page_index.min(page_count.saturating_sub(1));
-                    self.full_page = Some(image);
-                    self.full_page_revision = Some(revision);
-                    self.full_page_width = width;
-                    self.requested_raster = None;
-                    self.preview_scroll_rows = 0;
-                    self.status = PipelineStatus::Ready { elapsed, warnings };
-                    self.install_visible_preview();
-                }
-                WorkerEvent::RasterReady {
-                    revision,
-                    page_index,
-                    image,
-                    width,
-                } if revision == self.revision && page_index == self.page_index => {
-                    self.full_page = Some(image);
-                    self.full_page_revision = Some(revision);
-                    self.full_page_width = width;
-                    self.requested_raster = None;
-                    self.status = PipelineStatus::Ready {
-                        elapsed: Duration::ZERO,
-                        warnings: 0,
-                    };
-                    self.install_visible_preview();
-                }
-                WorkerEvent::Failed {
-                    revision,
-                    message,
-                    tex_line,
-                } if revision == self.revision => {
-                    self.requested_raster = None;
-                    self.status = PipelineStatus::Error(message);
-                    self.diagnostic_span = tex_line.and_then(|line| {
-                        self.generated
-                            .as_ref()
-                            .and_then(|generated| generated.source_span_for_output_line(line))
-                    });
-                }
-                WorkerEvent::ParseFailed {
-                    revision,
-                    message,
-                    byte,
-                } if revision == self.revision => {
-                    self.generated_revision = None;
-                    self.requested_raster = None;
-                    self.status = PipelineStatus::Error(message);
-                    self.diagnostic_span = Some(SourceSpan {
-                        start: byte,
-                        end: byte.saturating_add(1),
-                    });
-                }
-                _ => {}
-            }
+        while let Ok(event) = self.events_rx.try_recv() {
+            changed |= self.handle_loop_event(event);
         }
         changed
     }
 
+    fn handle_worker_event(&mut self, event: WorkerEvent) {
+        match event {
+            WorkerEvent::Built {
+                revision,
+                document,
+                words,
+            } if self
+                .generated_revision
+                .is_none_or(|generated| revision > generated) =>
+            {
+                self.source_words = words;
+                self.accept_built(revision, document);
+            }
+            WorkerEvent::ParseFailed {
+                revision,
+                message,
+                byte,
+            } if revision == self.revision => {
+                self.generated_revision = None;
+                self.status = PipelineStatus::Error(message);
+                self.diagnostic_span = Some(SourceSpan {
+                    start: byte,
+                    end: byte.saturating_add(1),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    /// Show a newly built revision's LaTeX and hand it to the pipeline. The pipeline diffs it
+    /// against the previous revision, so unchanged LaTeX costs no typesetting.
+    fn accept_built(&mut self, revision: u64, document: LatexDocument) {
+        self.generated = Some(document.clone());
+        self.generated_revision = Some(revision);
+        self.latex_scroll_rows = 0;
+        self.pipeline.send(PreviewCommand::Document {
+            revision,
+            source: document.source().to_owned(),
+        });
+        self.sent.insert(revision, document);
+        if !matches!(self.status, PipelineStatus::Empty) {
+            self.status = PipelineStatus::Typesetting;
+        }
+    }
+
+    fn handle_preview_event(&mut self, event: PreviewEvent) {
+        let empty = matches!(self.status, PipelineStatus::Empty);
+        match event {
+            PreviewEvent::Preparing if !empty => self.status = PipelineStatus::Preparing,
+            PreviewEvent::Preparing => {}
+            PreviewEvent::Failed(message) => self.status = PipelineStatus::Error(message),
+            PreviewEvent::Page(page) => {
+                self.page_count = page.pages;
+                if page.index == self.page_index {
+                    self.page = Some(page);
+                    self.present_preview();
+                }
+            }
+            PreviewEvent::Finished {
+                revision,
+                pages,
+                elapsed,
+                messages,
+                sync,
+            } => {
+                let newest = self.sent.last_key_value().map(|(newest, _)| *newest);
+                self.typeset_revision = Some(revision);
+                self.sync = sync;
+                self.sent = self.sent.split_off(&revision);
+                self.page_count = pages;
+                if pages > 0 && self.page_index >= pages {
+                    self.select_page(pages - 1);
+                }
+                if newest == Some(revision) && !empty {
+                    match messages.iter().find(|message| message.error) {
+                        Some(error) => {
+                            self.status = PipelineStatus::Error(error.message.clone());
+                            self.diagnostic_span = error
+                                .tex_line
+                                .and_then(|line| self.note_span_for(revision, line));
+                        }
+                        None => {
+                            self.status = PipelineStatus::Ready {
+                                elapsed,
+                                warnings: messages.len(),
+                            };
+                        }
+                    }
+                }
+                self.follow_cursor();
+            }
+        }
+    }
+
+    /// The note position that `revision`'s source line `line` typesets, moved across edits made
+    /// since that revision. Lines inside a multi-line paragraph map to their own note line.
+    fn note_span_for(&self, revision: u64, line: usize) -> Option<SourceSpan> {
+        let document = self.sent.get(&revision)?;
+        let byte = document.source_byte_for_output_line(line).or_else(|| {
+            document
+                .source_span_for_output_line(line)
+                .map(|span| span.start)
+        })?;
+        let start = map_offset_across_edit(document.note(), &self.buffer.text(), byte);
+        Some(SourceSpan {
+            start,
+            end: start.saturating_add(1),
+        })
+    }
+
+    /// The document the SyncTeX data belongs to.
+    fn typeset_document(&self) -> Option<&LatexDocument> {
+        self.sent.get(&self.typeset_revision?)
+    }
+
+    /// Point the preview at the cursor's typeset line, switching page if needed.
+    ///
+    /// The typeset document may trail the text while an edit is typeset. The cursor is mapped
+    /// across the pending edit into the note that document came from, so typing on a line keeps
+    /// its highlight in place.
+    fn follow_cursor(&mut self) {
+        let target = match (&self.sync, self.typeset_document()) {
+            (Some(sync), Some(document)) => {
+                let byte = map_offset_across_edit(
+                    &self.buffer.text(),
+                    document.note(),
+                    self.buffer.cursor_byte(),
+                );
+                document
+                    .output_line_for_source_byte(byte)
+                    .and_then(|line| sync.forward(line))
+            }
+            _ => None,
+        };
+        self.sync_target = target;
+        if let Some(target) = target
+            && target.page != self.page_index
+            && target.page < self.page_count
+        {
+            self.select_page(target.page);
+        }
+        self.present_preview();
+    }
+
+    /// Install the visible preview, first scrolling just enough to show the whole sync target
+    /// and marking it for highlighting.
+    fn present_preview(&mut self) {
+        self.highlight = None;
+        if let (Some(target), Some(page)) = (self.sync_target, &self.page)
+            && target.page == self.page_index
+        {
+            let height = page.image.height();
+            let top = (target.top * page.scale).floor().max(0.0) as u32;
+            let bottom = ((target.bottom * page.scale).ceil().max(0.0) as u32).min(height);
+            let font_height = u32::from(self.picker.font_size().height.max(1));
+            let viewport = u32::from(self.preview_size.height.max(1)) * font_height;
+            let max_scroll = height.saturating_sub(viewport);
+            let max_rows = max_scroll.div_ceil(font_height);
+            let crop = (u32::from(self.preview_scroll_rows) * font_height).min(max_scroll);
+
+            let rows = if top < crop || bottom.saturating_sub(top) > viewport {
+                Some(top / font_height)
+            } else if bottom > crop + viewport {
+                Some((bottom - viewport).div_ceil(font_height))
+            } else {
+                None
+            };
+            if let Some(rows) = rows {
+                self.preview_scroll_rows = rows.min(max_rows).min(u32::from(u16::MAX)) as u16;
+            }
+            self.highlight = Some((top, bottom));
+        }
+        self.install_visible_preview();
+    }
+
+    /// Crop the visible rows of the page, tint the highlighted lines, and hand the canvas to the
+    /// strip encoder.
     fn install_visible_preview(&mut self) {
-        let Some(page) = &self.full_page else {
+        let Some(page) = &self.page else {
             return;
         };
         if self.preview_size.width == 0 || self.preview_size.height == 0 {
             return;
         }
-        let key = (
-            self.full_page_revision,
-            self.page_index,
-            self.full_page_width,
-            self.preview_size.width,
-            self.preview_size.height,
-            self.preview_scroll_rows,
-        );
-        if self.active_preview_key == Some(key) || self.staging_preview_key == Some(key) {
+        let image = &page.image;
+        let font = self.picker.font_size();
+        let font_height = u32::from(font.height.max(1));
+        let viewport_height = (u32::from(self.preview_size.height) * font_height).max(1);
+        let max_y = image.height().saturating_sub(viewport_height);
+        let y = (u32::from(self.preview_scroll_rows) * font_height).min(max_y);
+        self.preview_scroll_rows = (y / font_height) as u16;
+
+        let key = PreviewViewport {
+            fingerprint: page.fingerprint,
+            page_index: page.index,
+            image_width: image.width(),
+            pane_width: self.preview_size.width,
+            pane_height: self.preview_size.height,
+            crop_y: y,
+            scale: page.scale,
+            highlight: self.highlight,
+        };
+        if self.strips.holds(&key) {
             return;
         }
-        let font = self.picker.font_size();
-        let viewport_height = u32::from(self.preview_size.height.max(1)) * u32::from(font.height);
-        let viewport_height = viewport_height.max(1);
-        let max_y = page.height().saturating_sub(viewport_height);
-        let requested_y = u32::from(self.preview_scroll_rows) * u32::from(font.height);
-        let y = requested_y.min(max_y);
-        self.preview_scroll_rows = (y / u32::from(font.height.max(1))) as u16;
 
-        let crop_height = viewport_height.min(page.height().saturating_sub(y)).max(1);
-        let cropped = page.crop_imm(0, y, page.width(), crop_height).to_rgba8();
+        let crop_height = viewport_height.min(image.height().saturating_sub(y)).max(1);
+        let cropped =
+            imageops::crop_imm(image.as_ref(), 0, y, image.width(), crop_height).to_image();
         let mut canvas =
-            ImageBuffer::from_pixel(page.width(), viewport_height, Rgba([255, 255, 255, 255]));
+            ImageBuffer::from_pixel(image.width(), viewport_height, Rgba([255, 255, 255, 255]));
         imageops::replace(&mut canvas, &cropped, 0, 0);
-        let protocol = self
-            .picker
-            .new_resize_protocol(DynamicImage::ImageRgba8(canvas));
-        self.staging_image.protocol.replace_protocol(protocol);
-        self.staging_image
-            .protocol
-            .resize_encode(&Resize::Fit(None), self.preview_size);
-        self.staging_preview = true;
-        self.staging_preview_key = Some(key);
+        if let (Some((top, bottom)), Some(accent)) = (self.highlight, Theme::default().accent_rgb())
+            && bottom > y
+        {
+            for row in top.saturating_sub(y)..(bottom - y).min(viewport_height) {
+                for column in 0..canvas.width() {
+                    let pixel = canvas.get_pixel_mut(column, row);
+                    for (channel, tint) in pixel.0.iter_mut().zip(accent) {
+                        *channel = (u16::from(*channel) * u16::from(tint) / 255) as u8;
+                    }
+                }
+            }
+        }
+        let canvas = fit_to_width(
+            canvas,
+            u32::from(self.preview_size.width) * u32::from(font.width),
+            font_height,
+        );
+        self.strips.install(key, &canvas);
     }
 
     fn scroll_preview(&mut self, rows: i16) {
-        let Some(page) = &self.full_page else {
+        let Some(page) = &self.page else {
             return;
         };
         let font_height = u32::from(self.picker.font_size().height.max(1));
         let viewport = u32::from(self.preview_size.height.max(1)) * font_height;
-        let max_rows = page.height().saturating_sub(viewport).div_ceil(font_height) as u16;
+        let max_rows = page
+            .image
+            .height()
+            .saturating_sub(viewport)
+            .div_ceil(font_height) as u16;
         self.preview_scroll_rows = self
             .preview_scroll_rows
             .saturating_add_signed(rows)
             .min(max_rows);
         self.install_visible_preview();
+    }
+
+    fn change_page(&mut self, delta: isize) {
+        if self.page_count == 0 {
+            return;
+        }
+        let next = self
+            .page_index
+            .saturating_add_signed(delta)
+            .min(self.page_count - 1);
+        self.sync_target = None;
+        self.highlight = None;
+        self.select_page(next);
+    }
+
+    fn select_page(&mut self, index: usize) {
+        if index == self.page_index {
+            return;
+        }
+        self.page_index = index;
+        self.preview_scroll_rows = 0;
+        // The shown strips stay until the new page's image arrives, so nothing flashes blank.
+        self.page = None;
+        self.request_view();
+    }
+
+    /// The preview pane's width in pixels, or `None` while the pane has no area.
+    fn target_width(&self) -> Option<u32> {
+        (self.preview_size.width > 0)
+            .then(|| u32::from(self.preview_size.width) * u32::from(self.picker.font_size().width))
+    }
+
+    /// Tell the pipeline which page to keep rendered, at the pane's width.
+    fn request_view(&mut self) {
+        let Some(width) = self.target_width() else {
+            return;
+        };
+        let view = (self.page_index, width);
+        if self.requested_view != Some(view) {
+            self.requested_view = Some(view);
+            self.pipeline.send(PreviewCommand::View {
+                page: view.0,
+                width: view.1,
+            });
+        }
     }
 
     fn scroll_latex(&mut self, rows: i16) {
@@ -813,8 +879,8 @@ impl App {
     fn pipeline_is_active(&self) -> bool {
         matches!(
             self.status,
-            PipelineStatus::Compiling { .. } | PipelineStatus::Rasterizing
-        ) || self.staging_preview
+            PipelineStatus::Waiting | PipelineStatus::Preparing | PipelineStatus::Typesetting
+        ) || self.strips.is_staging()
     }
 
     fn advance_spinner(&mut self) -> bool {
@@ -824,20 +890,6 @@ impl App {
         self.spinner_frame = self.spinner_frame.wrapping_add(1);
         self.last_spinner_tick = Instant::now();
         true
-    }
-
-    fn poll_interval(&self) -> Duration {
-        if self.pipeline_is_active() {
-            return ACTIVE_POLL_INTERVAL;
-        }
-        if matches!(self.status, PipelineStatus::Waiting)
-            && self.submitted_revision != Some(self.revision)
-        {
-            return COMPILE_DEBOUNCE
-                .saturating_sub(self.last_edit.elapsed())
-                .min(IDLE_POLL_INTERVAL);
-        }
-        IDLE_POLL_INTERVAL
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) {
@@ -853,12 +905,60 @@ impl App {
                     self.focus = PaneFocus::Latex;
                 } else if contains(self.preview_area, mouse.column, mouse.row) {
                     self.focus = PaneFocus::Preview;
+                    self.sync_from_preview_click(mouse.column, mouse.row);
                 }
             }
             MouseEventKind::ScrollUp => self.scroll_at(mouse.column, mouse.row, -3),
             MouseEventKind::ScrollDown => self.scroll_at(mouse.column, mouse.row, 3),
             _ => {}
         }
+    }
+
+    /// Move the source cursor to the note line typeset under a preview click.
+    ///
+    /// The click is mapped back through the width fit `install_visible_preview` applied to the
+    /// shown canvas (drawn from the pane's top-left corner), then from page pixels to points.
+    fn sync_from_preview_click(&mut self, column: u16, row: u16) -> bool {
+        let (Some(view), Some(sync), Some(document)) = (
+            self.strips.shown_key(),
+            self.sync.clone(),
+            self.typeset_document(),
+        ) else {
+            return false;
+        };
+        let inner = self.preview_area.inner(ratatui::layout::Margin::new(1, 1));
+        if !self.strips.is_visible() || view.scale <= 0.0 || !contains(inner, column, row) {
+            return false;
+        }
+
+        let font = self.picker.font_size();
+        let (font_width, font_height) = (f64::from(font.width), f64::from(font.height));
+        let pane_width = f64::from(inner.width) * font_width;
+        let ratio = (pane_width / f64::from(view.image_width.max(1))).min(1.0);
+        let x = (f64::from(column - inner.x) + 0.5) * font_width / ratio;
+        let y = (f64::from(row - inner.y) + 0.5) * font_height / ratio;
+        if x >= f64::from(view.image_width) {
+            return false;
+        }
+
+        let scale = f64::from(view.scale);
+        let Some(byte) = sync
+            .backward(
+                view.page_index,
+                (x / scale) as f32,
+                ((y + f64::from(view.crop_y)) / scale) as f32,
+                |line| document.is_content_line(line),
+            )
+            .and_then(|line| document.source_byte_for_output_line(line))
+            .map(|byte| map_offset_across_edit(document.note(), &self.buffer.text(), byte))
+        else {
+            return false;
+        };
+
+        self.buffer.set_cursor_byte(byte);
+        self.focus = PaneFocus::Source;
+        self.ensure_cursor_visible();
+        true
     }
 
     fn scroll_at(&mut self, column: u16, row: u16, rows: i16) {
@@ -913,33 +1013,6 @@ impl App {
         self.ensure_cursor_visible();
     }
 
-    fn change_page(&mut self, delta: isize) {
-        if self.page_count == 0 {
-            return;
-        }
-        let next = self
-            .page_index
-            .saturating_add_signed(delta)
-            .min(self.page_count - 1);
-        if next != self.page_index {
-            self.page_index = next;
-            self.preview_scroll_rows = 0;
-            self.full_page = None;
-            self.full_page_revision = None;
-            self.full_page_width = 0;
-            self.requested_raster = None;
-            let _ = self.maybe_submit_raster();
-        }
-    }
-
-    fn target_raster_width(&self) -> u32 {
-        if self.preview_size.width == 0 {
-            return DEFAULT_RASTER_WIDTH;
-        }
-        let width = u32::from(self.preview_size.width) * u32::from(self.picker.font_size().width);
-        width.clamp(320, 2400)
-    }
-
     fn ensure_cursor_visible(&mut self) {
         let (line, _) = self.buffer.cursor_line_column();
         let height = usize::from(self.source_size.height.max(1));
@@ -964,15 +1037,15 @@ impl App {
         latex_size: Size,
         preview_size: Size,
     ) {
-        let old_target = self.target_raster_width();
+        let resized = preview_size != self.preview_size;
         self.source_size = source_size;
         self.latex_size = latex_size;
         self.preview_size = preview_size;
         self.latex_scroll_rows = self.latex_scroll_rows.min(self.max_latex_scroll());
         self.ensure_cursor_visible();
-        if self.target_raster_width() != old_target {
-            self.full_page_width = 0;
-            self.requested_raster = None;
+        if resized {
+            self.request_view();
+            self.install_visible_preview();
         }
     }
 
@@ -1019,6 +1092,10 @@ impl App {
         self.focus
     }
 
+    pub(crate) fn set_caret(&mut self, caret: Option<Position>) {
+        self.caret = caret;
+    }
+
     pub(crate) fn zen_mode(&self) -> bool {
         self.zen_mode
     }
@@ -1059,33 +1136,21 @@ impl App {
     }
 
     pub(crate) fn status_line(&self) -> String {
+        let spinner = SPINNER_FRAMES[self.spinner_frame % SPINNER_FRAMES.len()];
         match &self.status {
             PipelineStatus::Empty => String::from("type a note to begin"),
-            PipelineStatus::Waiting => String::from("waiting for input to settle"),
-            PipelineStatus::Compiling { bootstrap: true } => {
-                format!(
-                    "{} preparing local LaTeX resources and compiling…",
-                    SPINNER_FRAMES[self.spinner_frame % SPINNER_FRAMES.len()]
-                )
+            PipelineStatus::Waiting => format!("{spinner} building LaTeX…"),
+            PipelineStatus::Preparing => {
+                format!("{spinner} preparing local LaTeX resources…")
             }
-            PipelineStatus::Compiling { bootstrap: false } => {
-                format!(
-                    "{} compiling with embedded Tectonic…",
-                    SPINNER_FRAMES[self.spinner_frame % SPINNER_FRAMES.len()]
-                )
-            }
-            PipelineStatus::Rasterizing => format!(
-                "{} rendering PDF page…",
-                SPINNER_FRAMES[self.spinner_frame % SPINNER_FRAMES.len()]
-            ),
-            PipelineStatus::Ready { elapsed, warnings } if *warnings > 0 => format!(
-                "ready in {} ms with {warnings} warning(s)",
-                elapsed.as_millis()
-            ),
-            PipelineStatus::Ready { elapsed, .. } if !elapsed.is_zero() => {
-                format!("ready in {} ms", elapsed.as_millis())
-            }
-            PipelineStatus::Ready { .. } => String::from("ready"),
+            PipelineStatus::Typesetting => format!("{spinner} typesetting…"),
+            PipelineStatus::Ready { elapsed, warnings } => match warnings {
+                0 => format!("ready in {} ms", elapsed.as_millis()),
+                warnings => format!(
+                    "ready in {} ms with {warnings} warning(s)",
+                    elapsed.as_millis()
+                ),
+            },
             PipelineStatus::Error(message) => format!("error: {message}"),
         }
     }
@@ -1103,20 +1168,39 @@ impl App {
     }
 
     pub(crate) fn has_preview(&self) -> bool {
-        self.preview_visible
+        self.strips.is_visible()
     }
 
     pub(crate) fn preview_placeholder(&self) -> &'static str {
         if matches!(self.status, PipelineStatus::Empty) {
             "Start typing to build a LaTeX document."
         } else {
-            "Compiling the document preview…"
+            "Typesetting the document…"
         }
     }
 
-    pub(crate) fn image_state_mut(&mut self) -> &mut ThreadProtocol {
-        &mut self.active_image.protocol
+    pub(crate) fn render_preview(&mut self, area: Rect, buf: &mut Buffer) {
+        self.strips.render(area, buf);
     }
+}
+
+/// Scale a canvas wider than `max_width` pixels down to that width, then pad it with white to
+/// whole cell rows so it splits into strips. Only a page rendered for an older, wider pane is
+/// ever too wide.
+fn fit_to_width(canvas: RgbaImage, max_width: u32, font_height: u32) -> RgbaImage {
+    if canvas.width() <= max_width || max_width == 0 {
+        return canvas;
+    }
+    let ratio = f64::from(max_width) / f64::from(canvas.width());
+    let height = (f64::from(canvas.height()) * ratio).round().max(1.0) as u32;
+    let scaled = imageops::resize(&canvas, max_width, height, imageops::FilterType::Triangle);
+    let mut padded = ImageBuffer::from_pixel(
+        max_width,
+        height.div_ceil(font_height) * font_height,
+        Rgba([255, 255, 255, 255]),
+    );
+    imageops::replace(&mut padded, &scaled, 0, 0);
+    padded
 }
 
 fn contains(area: Rect, column: u16, row: u16) -> bool {
@@ -1128,193 +1212,126 @@ fn contains(area: Rect, column: u16, row: u16) -> bool {
         && row < area.y.saturating_add(area.height)
 }
 
-fn pipeline_worker(requests: mpsc::Receiver<WorkerRequest>, events: mpsc::Sender<WorkerEvent>) {
-    while let Ok(mut request) = requests.recv() {
-        while let Ok(newer) = requests.try_recv() {
-            request = newer;
-        }
-
-        match request {
-            WorkerRequest::Compile {
-                revision,
-                source,
-                page_index,
-                target_width,
-            } => {
-                let started = Instant::now();
-                let words = source.split_whitespace().count();
-                let document = match Document::parse(&source) {
-                    Ok(document) => emit_latex(&document),
-                    Err(error) => {
-                        let byte = match &error {
-                            crate::note::NoteError::InvalidMath { byte, .. } => *byte,
-                        };
-                        let _ = events.send(WorkerEvent::ParseFailed {
-                            revision,
-                            message: error.to_string(),
-                            byte,
-                        });
-                        continue;
-                    }
-                };
-                if events
-                    .send(WorkerEvent::Built {
-                        revision,
-                        document: document.clone(),
-                        words,
-                    })
-                    .is_err()
-                {
+fn spawn_terminal_reader(events: mpsc::Sender<LoopEvent>) {
+    thread::spawn(move || {
+        loop {
+            let event = match event::read() {
+                Ok(event) => LoopEvent::Terminal(event),
+                Err(error) => {
+                    let _ = events.send(LoopEvent::TerminalFailed(error));
                     return;
                 }
-                match compile_latex(CompileRequest::new(revision, &document)) {
-                    Ok(output) => {
-                        let warnings = output
-                            .diagnostics
-                            .messages
-                            .iter()
-                            .filter(|message| message.kind == DiagnosticKind::Warning)
-                            .count();
-                        let pdf = Arc::new(output.pdf);
-                        match inspect_pdf(pdf.as_slice()).and_then(|info| {
-                            let selected = page_index.min(info.page_count.saturating_sub(1));
-                            rasterize_page(pdf.as_slice(), selected, target_width)
-                                .map(|preview| (info.page_count, preview))
-                        }) {
-                            Ok((page_count, preview)) => {
-                                let _ = events.send(WorkerEvent::Ready {
-                                    revision,
-                                    pdf,
-                                    page_count,
-                                    page_index: preview.page_index,
-                                    image: preview.image,
-                                    width: preview.width,
-                                    elapsed: started.elapsed(),
-                                    warnings,
-                                });
-                            }
-                            Err(error) => {
-                                let _ = events.send(WorkerEvent::Failed {
-                                    revision,
-                                    message: error.to_string(),
-                                    tex_line: None,
-                                });
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        let (message, tex_line) = summarize_compile_error(&error);
-                        let _ = events.send(WorkerEvent::Failed {
-                            revision,
-                            message,
-                            tex_line,
-                        });
-                    }
-                }
-            }
-            WorkerRequest::Raster {
-                revision,
-                pdf,
-                page_index,
-                target_width,
-            } => match rasterize_page(pdf.as_slice(), page_index, target_width) {
-                Ok(preview) => {
-                    let _ = events.send(WorkerEvent::RasterReady {
-                        revision,
-                        page_index,
-                        image: preview.image,
-                        width: preview.width,
-                    });
-                }
-                Err(error) => {
-                    let _ = events.send(WorkerEvent::Failed {
-                        revision,
-                        message: error.to_string(),
-                        tex_line: None,
-                    });
-                }
-            },
-        }
-    }
-}
-
-fn summarize_compile_error(error: &CompileError) -> (String, Option<usize>) {
-    let mut details = error.to_string();
-    let mut tex_line = None;
-    if let Some(diagnostics) = error.diagnostics() {
-        let logs = diagnostics.error_logs.join("\n");
-        let messages = diagnostics
-            .messages
-            .iter()
-            .map(|message| {
-                message.error.as_ref().map_or_else(
-                    || message.message.clone(),
-                    |error| format!("{}: {error}", message.message),
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        tex_line = extract_tex_line(&format!("{logs}\n{messages}"));
-        if let Some(line) = logs
-            .lines()
-            .find(|line| line.starts_with('!') || line.contains("error:"))
-        {
-            details.push_str(": ");
-            details.push_str(line.trim());
-        } else if let Some(message) = diagnostics.messages.last() {
-            details.push_str(": ");
-            details.push_str(&message.message);
-        }
-    }
-    (details, tex_line)
-}
-
-fn extract_tex_line(log: &str) -> Option<usize> {
-    let mut remainder = log;
-    while let Some(index) = remainder.find("mathnote.tex:") {
-        remainder = &remainder[index + "mathnote.tex:".len()..];
-        let digits: String = remainder
-            .chars()
-            .take_while(|character| character.is_ascii_digit())
-            .collect();
-        if let Ok(line) = digits.parse() {
-            return Some(line);
-        }
-    }
-
-    for marker in ["\nl.", " l."] {
-        let mut remainder = log;
-        while let Some(index) = remainder.find(marker) {
-            remainder = &remainder[index + marker.len()..];
-            let digits: String = remainder
-                .chars()
-                .take_while(|character| character.is_ascii_digit())
-                .collect();
-            if let Ok(line) = digits.parse() {
-                return Some(line);
+            };
+            if events.send(event).is_err() {
+                return;
             }
         }
-    }
-    None
+    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::driver::TexMessage;
 
     fn press(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
-    fn wait_for_staged_preview(app: &mut App) {
-        for _ in 0..100 {
+    fn recording_app() -> App {
+        let mut app =
+            App::with_pipeline(
+                Picker::halfblocks(),
+                |_| PipelineLink::Recording(Vec::new()),
+            );
+        app.configure_layout(Size::new(40, 20), Size::new(30, 20), Size::new(20, 8));
+        app
+    }
+
+    fn recorded(app: &App) -> &[PreviewCommand] {
+        match &app.pipeline {
+            PipelineLink::Recording(sent) => sent,
+            _ => &[],
+        }
+    }
+
+    /// Submit the current text and wait until the worker has built it.
+    fn build(app: &mut App) {
+        app.maybe_submit_build();
+        for _ in 0..200 {
             app.process_background_events();
-            if !app.staging_preview {
+            if app.generated_revision == Some(app.revision) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        panic!("timed out waiting for the note build");
+    }
+
+    fn wait_for_encoded_strips(app: &mut App) {
+        for _ in 0..200 {
+            app.process_background_events();
+            if !app.strips.is_staging() {
                 return;
             }
             thread::sleep(Duration::from_millis(5));
         }
         panic!("timed out waiting for terminal preview encoding");
+    }
+
+    fn white_page(index: usize, width: u32, height: u32, fingerprint: u64) -> RenderedPage {
+        RenderedPage {
+            index,
+            pages: 1,
+            fingerprint,
+            scale: 1.0,
+            image: Arc::new(ImageBuffer::from_pixel(
+                width,
+                height,
+                Rgba([255, 255, 255, 255]),
+            )),
+        }
+    }
+
+    fn finished(revision: u64, messages: Vec<TexMessage>, sync: Option<SyncIndex>) -> LoopEvent {
+        LoopEvent::Preview(PreviewEvent::Finished {
+            revision,
+            pages: 1,
+            elapsed: Duration::from_millis(12),
+            messages,
+            sync: sync.map(Arc::new),
+        })
+    }
+
+    /// A built note `alpha\nbeta` whose typeset page has line boxes for `alpha` at 500 pt and
+    /// `beta` at 1000 pt on a 200×2000 px page rendered at one pixel per point.
+    fn synced_app() -> (App, SyncIndex, usize) {
+        let mut app = recording_app();
+        app.buffer.insert_str("alpha\nbeta");
+        app.mark_edited();
+        build(&mut app);
+
+        let document = &app.sent[&app.revision];
+        let alpha = document
+            .output_line_for_source_byte(0)
+            .expect("alpha is typeset");
+        let beta = document
+            .output_line_for_source_byte(6)
+            .expect("beta is typeset");
+        let sync = SyncIndex::parse(&format!(
+            "SyncTeX Version:1\nInput:1:texput\nMagnification:1000\nUnit:1\nContent:\n{{1\n\
+             [1,1:0,0:0,0,0\n\
+             (1,{alpha}:4736287,32890880:39469056,655360,196608\n\
+             g1,{alpha}:13156352,32890880\n)\n\
+             (1,{beta}:4736287,65781760:39469056,655360,196608\n\
+             g1,{beta}:13156352,65781760\n)\n]\n}}1\n"
+        ))
+        .expect("fixture parses");
+        app.handle_loop_event(LoopEvent::Preview(PreviewEvent::Page(white_page(
+            0, 200, 2000, 1,
+        ))));
+        app.handle_loop_event(finished(app.revision, Vec::new(), Some(sync.clone())));
+        (app, sync, beta)
     }
 
     #[test]
@@ -1385,7 +1402,7 @@ mod tests {
     }
 
     #[test]
-    fn settled_source_is_built_on_the_worker_not_the_typing_path() {
+    fn edited_source_is_built_on_the_worker_not_the_typing_path() {
         let mut app = App::default();
         app.buffer.insert_str("x plus y");
         app.mark_edited();
@@ -1394,16 +1411,7 @@ mod tests {
         assert!(matches!(app.status, PipelineStatus::Waiting));
         assert_eq!(app.source_stats().0, 8);
 
-        app.last_edit = Instant::now() - COMPILE_DEBOUNCE;
-        assert!(app.maybe_submit_compile());
-        for _ in 0..100 {
-            app.process_background_events();
-            if app.generated_revision == Some(app.revision) {
-                break;
-            }
-            thread::sleep(Duration::from_millis(5));
-        }
-        assert_eq!(app.generated_revision, Some(app.revision));
+        build(&mut app);
         assert_eq!(app.source_stats().1, Some(3));
     }
 
@@ -1412,10 +1420,9 @@ mod tests {
         let mut app = App::default();
         app.buffer.insert_str("$$\nx");
         app.mark_edited();
-        app.last_edit = Instant::now() - COMPILE_DEBOUNCE;
-        assert!(app.maybe_submit_compile());
+        app.maybe_submit_build();
 
-        for _ in 0..100 {
+        for _ in 0..200 {
             app.process_background_events();
             if matches!(app.status, PipelineStatus::Error(_)) {
                 break;
@@ -1427,17 +1434,139 @@ mod tests {
     }
 
     #[test]
-    fn event_polling_is_slow_when_idle_and_fast_during_pipeline_work() {
-        let mut app = App::default();
-        assert_eq!(app.poll_interval(), IDLE_POLL_INTERVAL);
-
-        app.buffer.insert_str("x");
+    fn each_built_revision_is_sent_for_typesetting() {
+        let mut app = recording_app();
+        app.buffer.insert_str("alpha");
         app.mark_edited();
-        assert!(app.poll_interval() <= COMPILE_DEBOUNCE);
+        build(&mut app);
 
-        app.last_edit = Instant::now() - COMPILE_DEBOUNCE;
-        assert!(app.maybe_submit_compile());
-        assert_eq!(app.poll_interval(), ACTIVE_POLL_INTERVAL);
+        let document = recorded(&app)
+            .iter()
+            .rev()
+            .find_map(|command| match command {
+                PreviewCommand::Document { revision, source } => Some((*revision, source)),
+                PreviewCommand::View { .. } => None,
+            });
+        let (revision, source) = document.expect("the build was sent");
+        assert_eq!(revision, app.revision);
+        assert!(source.contains("alpha"));
+        assert!(matches!(app.status, PipelineStatus::Typesetting));
+    }
+
+    #[test]
+    fn the_pane_width_is_requested_from_the_pipeline() {
+        let app = recording_app();
+        let width = 20 * u32::from(app.picker.font_size().width);
+        assert!(recorded(&app).iter().any(|command| matches!(
+            command,
+            PreviewCommand::View { page: 0, width: requested } if *requested == width
+        )));
+    }
+
+    #[test]
+    fn finished_typesetting_reports_ready_and_highlights_the_cursor_line() {
+        let (app, sync, beta) = synced_app();
+
+        assert_eq!(app.status_line(), "ready in 12 ms");
+        let target = sync.forward(beta).expect("beta has a line box");
+        let (top, bottom) = (target.top.floor() as u32, target.bottom.ceil() as u32);
+        assert_eq!(app.highlight, Some((top, bottom)));
+
+        let font_height = u32::from(app.picker.font_size().height);
+        let viewport = u32::from(app.preview_size.height) * font_height;
+        let crop = u32::from(app.preview_scroll_rows) * font_height;
+        assert!(crop > 0);
+        assert!(crop <= top && bottom <= crop + viewport);
+    }
+
+    #[test]
+    fn typing_on_the_highlighted_line_keeps_the_encoded_preview() {
+        let (mut app, _, _) = synced_app();
+        wait_for_encoded_strips(&mut app);
+        let highlight = app.highlight;
+
+        app.handle_event(Event::Key(press(KeyCode::Char('x'))));
+
+        assert_ne!(Some(app.revision), app.typeset_revision);
+        assert_eq!(app.highlight, highlight);
+        assert!(!app.strips.is_staging());
+    }
+
+    #[test]
+    fn clicking_the_preview_moves_the_source_cursor_to_that_line() {
+        let (mut app, _, _) = synced_app();
+        wait_for_encoded_strips(&mut app);
+        app.buffer.set_cursor_line_column(0, 0);
+        app.configure_pane_areas(
+            Rect::new(0, 0, 40, 10),
+            Rect::new(40, 0, 30, 10),
+            Rect::new(70, 0, 22, 10),
+        );
+
+        let view = app.strips.shown_key().expect("preview is encoded");
+        let (top, bottom) = view.highlight.expect("beta is highlighted");
+        let font_height = u32::from(app.picker.font_size().height);
+        let row = 1 + ((top + bottom) / 2 - view.crop_y) / font_height;
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 75,
+            row: row as u16,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        assert_eq!(app.focus(), PaneFocus::Source);
+        assert_eq!(app.cursor_line_column(), (1, 0));
+    }
+
+    #[test]
+    fn a_change_within_one_cell_row_re_encodes_only_that_strip() {
+        let mut app = recording_app();
+        let font = app.picker.font_size();
+        let (width, height) = (20 * u32::from(font.width), 8 * u32::from(font.height));
+        app.handle_loop_event(LoopEvent::Preview(PreviewEvent::Page(white_page(
+            0, width, height, 1,
+        ))));
+        wait_for_encoded_strips(&mut app);
+        assert!(app.has_preview());
+
+        let mut page = ImageBuffer::from_pixel(width, height, Rgba([255, 255, 255, 255]));
+        let row_top = 3 * u32::from(font.height);
+        for y in row_top + 1..row_top + 4 {
+            for x in 0..width / 2 {
+                page.put_pixel(x, y, Rgba([0, 0, 0, 255]));
+            }
+        }
+        let mut changed = white_page(0, width, height, 2);
+        changed.image = Arc::new(page);
+        app.handle_loop_event(LoopEvent::Preview(PreviewEvent::Page(changed)));
+
+        assert_eq!(app.strips.staged_strips(), Some(&[3][..]));
+        wait_for_encoded_strips(&mut app);
+        assert!(app.has_preview());
+    }
+
+    #[test]
+    fn tex_errors_mark_their_note_line() {
+        let mut app = recording_app();
+        app.buffer.insert_str("alpha\nbeta");
+        app.mark_edited();
+        build(&mut app);
+        let beta = app.sent[&app.revision]
+            .output_line_for_source_byte(6)
+            .expect("beta is typeset");
+
+        app.handle_loop_event(finished(
+            app.revision,
+            vec![TexMessage {
+                error: true,
+                message: String::from("Undefined control sequence"),
+                tex_line: Some(beta),
+            }],
+            None,
+        ));
+
+        assert_eq!(app.status_line(), "error: Undefined control sequence");
+        assert_eq!(app.diagnostic_line(), Some(1));
     }
 
     #[test]
@@ -1454,64 +1583,18 @@ mod tests {
     }
 
     #[test]
-    fn blank_notes_do_not_submit_a_compile() {
+    fn whitespace_only_notes_remain_in_the_empty_state() {
         let mut app = App::default();
-        app.maybe_submit_compile();
+        app.buffer.insert_str(" \n\t");
+        app.mark_edited();
+        app.maybe_submit_build();
 
         assert!(matches!(app.status, PipelineStatus::Empty));
-        assert_eq!(app.submitted_revision, None);
         assert_eq!(app.status_line(), "type a note to begin");
         assert_eq!(
             app.preview_placeholder(),
             "Start typing to build a LaTeX document."
         );
-    }
-
-    #[test]
-    fn whitespace_only_notes_remain_in_the_empty_state() {
-        let mut app = App::default();
-        app.buffer.insert_str(" \n\t");
-        app.mark_edited();
-        app.maybe_submit_compile();
-
-        assert!(matches!(app.status, PipelineStatus::Empty));
-        assert_eq!(app.submitted_revision, None);
-    }
-
-    #[test]
-    fn rendered_preview_stays_visible_while_replacement_is_encoded() {
-        let mut app = App {
-            preview_size: Size::new(20, 8),
-            full_page: Some(DynamicImage::ImageRgba8(ImageBuffer::from_pixel(
-                320,
-                240,
-                Rgba([255, 255, 255, 255]),
-            ))),
-            full_page_revision: Some(1),
-            ..App::default()
-        };
-
-        app.install_visible_preview();
-        assert!(!app.has_preview());
-        wait_for_staged_preview(&mut app);
-        assert!(app.has_preview());
-
-        app.install_visible_preview();
-        assert!(!app.staging_preview);
-
-        app.revision = app.revision.wrapping_add(1);
-        app.full_page_revision = Some(app.revision);
-        app.full_page = Some(DynamicImage::ImageRgba8(ImageBuffer::from_pixel(
-            320,
-            240,
-            Rgba([240, 240, 240, 255]),
-        )));
-        app.install_visible_preview();
-
-        assert!(app.staging_preview);
-        assert!(app.has_preview());
-        wait_for_staged_preview(&mut app);
-        assert!(app.has_preview());
     }
 
     #[test]

@@ -4,9 +4,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
     Block, BorderType, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
-    StatefulWidget, Wrap,
+    Wrap,
 };
-use ratatui_image::StatefulImage;
 
 use crate::App;
 use crate::app::PaneFocus;
@@ -28,6 +27,7 @@ pub(crate) fn render(frame: &mut Frame, app: &mut App) {
 
     app.configure_pane_areas(panes.source, panes.latex, panes.preview);
     let source_inner = render_source(frame, app, panes.source, &theme);
+    app.set_caret(caret_position(app, source_inner));
     let latex_inner = render_generated_latex(frame, app, panes.latex, &theme);
     let preview_inner = render_preview(frame, app, panes.preview, &theme);
     app.configure_layout(
@@ -108,12 +108,6 @@ fn render_source(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) -> Rec
         content,
     );
 
-    if focused {
-        let (cursor_x, cursor_y) = app.cursor_screen_position();
-        if cursor_x < content.width && cursor_y < content.height {
-            frame.set_cursor_position(Position::new(content.x + cursor_x, content.y + cursor_y));
-        }
-    }
     render_scrollbar(
         frame,
         area,
@@ -122,6 +116,16 @@ fn render_source(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) -> Rec
         theme,
     );
     content
+}
+
+/// The terminal cell of the editing caret when the source pane has focus and the caret is inside
+/// the visible text area.
+fn caret_position(app: &App, content: Rect) -> Option<Position> {
+    if app.focus() != PaneFocus::Source {
+        return None;
+    }
+    let (x, y) = app.cursor_screen_position();
+    (x < content.width && y < content.height).then(|| Position::new(content.x + x, content.y + y))
 }
 
 fn render_generated_latex(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) -> Rect {
@@ -171,7 +175,7 @@ fn render_preview(frame: &mut Frame, app: &mut App, area: Rect, theme: &Theme) -
     frame.render_widget(Clear, inner);
     frame.render_widget(Block::new().style(Style::default().bg(Color::White)), inner);
     if app.has_preview() {
-        StatefulImage::new().render(inner, frame.buffer_mut(), app.image_state_mut());
+        app.render_preview(inner, frame.buffer_mut());
     } else {
         frame.render_widget(
             Paragraph::new(app.preview_placeholder())
@@ -272,7 +276,7 @@ fn render_help(frame: &mut Frame, theme: &Theme) {
     let area = centered_rect(
         frame.area(),
         frame.area().width.saturating_mul(4) / 5,
-        frame.area().height.saturating_mul(4) / 5,
+        frame.area().height,
     );
     frame.render_widget(Clear, area);
     let help = Text::from(vec![
@@ -281,23 +285,30 @@ fn render_help(frame: &mut Frame, theme: &Theme) {
         help_binding("F2", "toggle distraction-free zen mode", theme),
         help_binding("F6 / Shift-F6", "cycle panes forward / backward", theme),
         help_binding("Esc / Ctrl-C", "quit mathnote", theme),
-        Line::from(""),
         help_heading("EDITOR", theme),
         help_binding("Tab", "insert four spaces", theme),
-        help_binding("Arrows / Home / End", "move the editing cursor", theme),
+        help_binding(
+            "Arrows / Home / End",
+            "move the cursor; the preview follows its line",
+            theme,
+        ),
+        help_binding("PageUp / PageDown", "change preview page", theme),
+        help_binding("Ctrl-↑ / Ctrl-↓", "scroll the preview", theme),
         help_binding("Ctrl-U", "clear the note", theme),
-        Line::from(""),
         help_heading("INSPECTORS", theme),
         help_binding("h / l", "move between panes", theme),
         help_binding("j / k or arrows", "scroll the focused pane", theme),
         help_binding(
             "PageUp / PageDown",
-            "scroll LaTeX or change PDF page",
+            "scroll LaTeX or change preview page",
             theme,
         ),
-        Line::from(""),
         help_heading("MOUSE", theme),
-        help_binding("Click", "focus a pane or place the source cursor", theme),
+        help_binding(
+            "Click",
+            "focus a pane, place the cursor, or jump from the preview",
+            theme,
+        ),
         help_binding("Wheel", "scroll the pane under the pointer", theme),
     ]);
     let block = panel_block(" ⌨ COMMAND REFERENCE  │  F1 / ESC CLOSE ", true, theme);
@@ -427,7 +438,7 @@ mod tests {
         let screen = render_screen(100, 24, true);
         assert!(screen.contains("COMMAND REFERENCE"));
         assert!(screen.contains("F6 / Shift-F6"));
-        assert!(screen.contains("PageUp / PageDown"));
+        assert!(screen.contains("jump from the preview"));
         assert!(screen.contains("MOUSE"));
     }
 

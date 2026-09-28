@@ -1,4 +1,4 @@
-use mathnote::document::{Block, Document, Inline, TextBuffer};
+use mathnote::document::{Block, Document, Inline, TextBuffer, map_offset_across_edit};
 use mathnote::latex::{emit_latex, escape_prose};
 use mathnote::note::{NoteLine, NoteSegment};
 
@@ -188,4 +188,66 @@ fn inline_source_spans_remain_exact_after_hidden_delimiters() {
 
     assert_eq!(&input[span.range()], "root of 81");
     assert_eq!(&input[source.range()], " after");
+}
+
+#[test]
+fn compiled_lines_are_anchored_and_map_back_to_note_lines() {
+    let latex = emit_latex(&Document::parse("alpha\nbeta\n\ngamma\n").expect("paragraphs parse"));
+    let alpha = latex
+        .output_line_for_source_byte(0)
+        .expect("alpha is typeset");
+    let beta = latex
+        .output_line_for_source_byte(6)
+        .expect("beta is typeset");
+    let gamma = latex
+        .output_line_for_source_byte(12)
+        .expect("gamma is typeset");
+
+    assert_eq!(beta, alpha + 1);
+    assert_eq!(
+        latex.source().lines().nth(beta - 1),
+        Some(r"beta\hskip0pt{}")
+    );
+    assert!(!latex.body().contains("hskip"));
+    assert_eq!(latex.source_byte_for_output_line(beta), Some(6));
+    assert_eq!(latex.source_byte_for_output_line(gamma), Some(12));
+    assert_eq!(latex.output_line_for_source_byte(11), None);
+    assert!(!latex.is_content_line(beta + 1));
+}
+
+#[test]
+fn content_lines_lists_exactly_the_content_lines() {
+    let note = "alpha $x squared$\nbeta\n\n$$\nintegral of x\n$$\n\ngamma $root of 81$\ndelta\n";
+    let latex = emit_latex(&Document::parse(note).expect("note parses"));
+    let expected = (1..=latex.source().lines().count() + 1)
+        .filter(|line| latex.is_content_line(*line))
+        .collect::<Vec<_>>();
+
+    assert!(expected.len() >= 5);
+    assert_eq!(latex.content_lines(), expected);
+}
+
+#[test]
+fn byte_cursor_lands_on_multibyte_character_boundaries() {
+    let mut buffer = TextBuffer::new("α\nβ");
+    buffer.set_cursor_byte(3);
+
+    assert_eq!(buffer.cursor_line_column(), (1, 0));
+    assert_eq!(buffer.cursor_byte(), 3);
+}
+
+#[test]
+fn offsets_map_across_a_pending_edit() {
+    let compiled = "alpha\nbeta\ngamma";
+    let typed = "alpha\nbetaXY\ngamma";
+
+    assert_eq!(map_offset_across_edit(typed, compiled, 2), 2);
+    assert_eq!(map_offset_across_edit(typed, compiled, 11), 10);
+    assert_eq!(map_offset_across_edit(typed, compiled, 12), 10);
+    assert_eq!(map_offset_across_edit(typed, compiled, 14), 12);
+    assert_eq!(map_offset_across_edit(compiled, typed, 12), 14);
+
+    let greek = "λ\nα";
+    let edited = "λ\nβα";
+    assert_eq!(map_offset_across_edit(edited, greek, 5), 3);
 }
