@@ -46,7 +46,7 @@ struct PreviewViewport {
 }
 
 /// The editor: the note, its generated LaTeX, and the live preview of the typeset page. The
-/// typesetting pipeline (texpresso's driver) runs on a background thread.
+/// typesetting pipeline (the snapshot driver) runs on a background thread.
 pub struct App {
     buffer: TextBuffer,
     should_quit: bool,

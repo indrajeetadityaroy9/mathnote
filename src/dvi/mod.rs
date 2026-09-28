@@ -1,4 +1,4 @@
-//! Incremental XDV rendering: texpresso's `src/dvi/*` plus the MuPDF drawing it relied on.
+//! Incremental XDV rendering: reading the engine's growing output and drawing its pages.
 //!
 //! * [`XdvDocument`] reads the growing XDV output of the engine and exposes complete pages.
 //! * [`FontStore`] loads TFM metrics, `pdftex.map` Type1 fonts and XeTeX native fonts through a

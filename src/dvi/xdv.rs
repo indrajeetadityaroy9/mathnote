@@ -1,8 +1,8 @@
 //! Incremental DVI/XDV reader.
 //!
-//! Semantics follow DVItype and texpresso's `dvi_interp.c` / `dvi_prim.c` / `incdvi.c`; the XDV
-//! extensions (`define_native_font` 252, `set_glyphs` 253, `set_text_and_glyphs` 254) use the byte
-//! layouts XeTeX writes (`xetex-ext.c` `make_font_def`, `xetex-shipout.c`).
+//! Semantics follow DVItype; the XDV extensions (`define_native_font` 252, `set_glyphs` 253,
+//! `set_text_and_glyphs` 254) use the byte layouts XeTeX writes (`xetex-ext.c` `make_font_def`,
+//! `xetex-shipout.c`).
 //!
 //! [`XdvDocument::update`] is fed the whole engine output every time. Only complete pages
 //! (`bop..eop`) become [`XdvPage`]s; an unfinished page is scanned as far as the bytes go and

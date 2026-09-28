@@ -263,7 +263,7 @@ impl FontStore {
 }
 
 /// Bundle names to try for an XDV native font: the basename, with an extension when it has
-/// none (texpresso's resource manager does the same).
+/// none.
 fn native_candidates(name: &str) -> Vec<String> {
     let name = name.trim_matches(['[', ']', '"']);
     let base = name.rsplit('/').next().unwrap_or(name);

@@ -1,4 +1,4 @@
-//! `TexDriver`: a port of texpresso's `frontend/engine_tex.c` for one primary document.
+//! `TexDriver`: incremental typesetting of one primary document over snapshot engine processes.
 //!
 //! The driver runs `<engine_exe> --tex-engine <cache_dir>` (see [`crate::engine`]) and answers its
 //! queries over [`crate::protocol`]. Engine processes form a stack: the root and the `fork()`
@@ -24,10 +24,10 @@ use crate::protocol::{
     Answer, DriverChannel, ENGINE_CHANNEL_FD, Q_SEEN, Query, QueryBody, STDOUT_FID, set_cloexec,
 };
 
-/// `MAX_PROCESS` (`engine_tex.c:65-68`).
+/// Most engine processes (snapshots plus the running one) kept at once.
 const MAX_PROCESS: usize = 32;
 const MAX_FENCES: usize = 16;
-/// `channel_has_pending_query(.., 10)` in `engine_step`.
+/// How long `engine_step` waits for a pending query.
 const ENGINE_POLL: Duration = Duration::from_millis(10);
 /// Silence after which a process that has consumed changed bytes is presumed stuck (see
 /// [`TexDriver::process_pending_messages`]).
@@ -71,10 +71,10 @@ pub struct DriverStats {
     pub live_processes: usize,
 }
 
-/// `process_t`.
+/// One engine process on the snapshot stack.
 struct Process {
     pid: i32,
-    /// `None` is texpresso's `fd == -1`.
+    /// `None` once the process has exited or was closed.
     chan: Option<DriverChannel>,
     trace_len: usize,
     snap: Mark,
@@ -83,7 +83,7 @@ struct Process {
     last_heard: Instant,
 }
 
-/// `trace_entry_t`: `seen` is the entry's position *before* this observation.
+/// One observation of an entry: `seen` is the entry's position *before* this observation.
 #[derive(Debug, Clone, Copy)]
 struct TraceEntry {
     entry: usize,
@@ -91,7 +91,7 @@ struct TraceEntry {
     time: u32,
 }
 
-/// `fence_t`.
+/// A position at which the next read of an entry is answered with `FORK`.
 #[derive(Debug, Clone, Copy)]
 struct Fence {
     entry: usize,
@@ -105,7 +105,7 @@ enum OutState {
     Closed,
 }
 
-/// `fileentry_t`: the primary input, or a named output buffer.
+/// The primary input, or a named output buffer.
 struct Entry {
     input: bool,
     seen: i64,
@@ -115,15 +115,15 @@ struct Entry {
     state: OutState,
 }
 
-/// Snapshot of the output log (texpresso's `mark_t` over `log_t`): the file table and every
-/// output's buffer, length and open state.
+/// Snapshot of the output log: the file table and every output's buffer, length and open
+/// state.
 #[derive(Clone, Default)]
 struct Mark {
     cells: HashMap<i32, usize>,
     outputs: Vec<(u64, usize, OutState)>,
 }
 
-/// The `rollback` transaction (`engine_tex.c:1310-1473`).
+/// One change transaction: opened, fed the changed offsets, then closed.
 #[derive(Clone, Copy)]
 struct Transaction {
     trace_len: usize,
@@ -140,7 +140,7 @@ struct Verification {
     changed: i64,
 }
 
-/// A protocol violation: texpresso aborts; we drop the offending process.
+/// A protocol violation: the offending process is dropped.
 struct Violation;
 
 pub struct TexDriver {
@@ -194,8 +194,8 @@ impl TexDriver {
         driver
     }
 
-    /// Replace the primary input. The first changed byte (`scan_entry`, `engine_tex.c:1243-1306`)
-    /// drives the change transaction; identical bytes are a no-op.
+    /// Replace the primary input. The first changed byte drives the change transaction;
+    /// identical bytes are a no-op.
     pub fn set_document(&mut self, source: &[u8]) {
         let Some(old) = self.document.as_deref() else {
             self.document = Some(source.to_vec());
@@ -211,7 +211,7 @@ impl TexDriver {
             return;
         }
 
-        // engine_begin_changes / notify_file_changes / engine_end_changes (`:1615-1646`).
+        // Open a change transaction for the primary input and roll back as far as needed.
         self.document = Some(source.to_vec());
         // An unverified earlier change still counts: roll back to the lowest changed offset.
         let changed = match self.take_verification() {
@@ -221,8 +221,8 @@ impl TexDriver {
         self.apply_change(PRIMARY, changed);
     }
 
-    /// One change transaction: `rollback_begin` / `rollback_add_change` / `rollback_end` +
-    /// `compute_fences` / `rollback_processes`.
+    /// One change transaction: open it, add the change, close it, place fences, and roll the
+    /// processes back.
     fn apply_change(&mut self, entry: usize, changed: i64) {
         self.rollback_begin();
         self.rollback_add_change(entry, changed);
@@ -232,9 +232,9 @@ impl TexDriver {
         }
     }
 
-    /// A deferred change whose process then stays silent for [`STUCK_AFTER`] gets the kill
-    /// texpresso applies at once: the process may be stuck in a loop, having consumed the
-    /// changed bytes, and would otherwise never settle the change.
+    /// A deferred change whose process then stays silent for [`STUCK_AFTER`] kills that
+    /// process: it may be stuck in a loop, having consumed the changed bytes, and would otherwise
+    /// never settle the change.
     fn expire_verification(&mut self) {
         let Some(pending) = self.verification else {
             return;
@@ -391,7 +391,7 @@ impl TexDriver {
         self.names.get(name).map(|&index| &self.entries[index])
     }
 
-    /// `filesystem_lookup_or_create`.
+    /// Index of the entry for `path`, created on first use.
     fn entry_for(&mut self, path: &str, input: bool) -> usize {
         if let Some(&index) = self.names.get(path) {
             return index;
@@ -407,7 +407,7 @@ impl TexDriver {
         self.entries.len() - 1
     }
 
-    /// `log_snapshot`.
+    /// Mark every output's current state.
     fn snapshot(&self) -> Mark {
         Mark {
             cells: self.cells.clone(),
@@ -419,7 +419,8 @@ impl TexDriver {
         }
     }
 
-    /// `log_rollback`: marks nest, so buffers created after `mark` are unreferenced and dropped.
+    /// Roll outputs back to `mark`: marks nest, so buffers created after `mark` are unreferenced
+    /// and dropped.
     fn log_rollback(&mut self, mark: &Mark) {
         self.cells = mark.cells.clone();
         let xdv = self.names.get(XDV_NAME).copied();
@@ -461,13 +462,13 @@ impl TexDriver {
         entry.state = OutState::Open;
     }
 
-    // Processes (`engine_tex.c:113-340`) ------------------------------------------------------
+    // Processes -------------------------------------------------------------------------------
 
     fn top(&self) -> usize {
         self.processes.len() - 1
     }
 
-    /// `prepare_process` + `exec_xelatex_generic`.
+    /// Start the root engine process when the stack is empty.
     fn prepare_process(&mut self) {
         if !self.processes.is_empty() {
             return;
@@ -508,7 +509,7 @@ impl TexDriver {
         command
             .arg("--tex-engine")
             .arg(&self.config.cache_dir)
-            // macOS: allow Objective-C initialisation in forked snapshots (`engine_tex.c:156-162`).
+            // macOS: allow Objective-C initialisation in forked snapshots.
             .env("OBJC_DISABLE_INITIALIZE_FORK_SAFETY", "YES")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -539,7 +540,7 @@ impl TexDriver {
         }
     }
 
-    /// `close_process`: SIGTERM + close.
+    /// Stop a process: SIGTERM and close its channel.
     fn close_process(&mut self, index: usize) {
         let process = &mut self.processes[index];
         if process.chan.take().is_some() {
@@ -547,7 +548,7 @@ impl TexDriver {
         }
     }
 
-    /// `pop_process`: roll outputs back to the parent snapshot's mark, or to empty.
+    /// Pop the top process and roll outputs back to the parent snapshot's mark, or to empty.
     fn pop_process(&mut self) {
         let top = self.top();
         if self
@@ -569,7 +570,7 @@ impl TexDriver {
         }
     }
 
-    /// `decimate_processes` (`:278-339`): keep exponentially spaced snapshots.
+    /// Thin out a full stack, keeping exponentially spaced snapshots.
     fn decimate_processes(&mut self) {
         let count = self.processes.len();
         let mut keep = [false; MAX_PROCESS];
@@ -614,9 +615,9 @@ impl TexDriver {
             .retain_mut(|child| matches!(child.try_wait(), Ok(None)));
     }
 
-    // Trace (`:410-527`) ---------------------------------------------------------------------
+    // Trace -----------------------------------------------------------------------------------
 
-    /// `record_seen`.
+    /// Record that the top process has seen `entry` up to `seen`.
     fn record_seen(&mut self, entry: usize, seen: i64, time: u32) {
         let count = self.processes.len();
         let trace_len = self.processes[count - 1].trace_len;
@@ -643,13 +644,14 @@ impl TexDriver {
         self.entries[entry.entry].seen = entry.seen;
     }
 
-    /// `incdvi_output_started`: page data follows the XDV preamble.
+    /// Whether page data follows the XDV preamble.
     fn xdv_output_started(&self) -> bool {
         let xdv = self.xdv();
         xdv.len() > 15 && xdv.len() > 15 + usize::from(xdv[14])
     }
 
-    /// `need_snapshot` (`:482-528`).
+    /// Whether to answer the next read with `FORK`: once 500 ms of engine time have passed since
+    /// the last snapshot, and never while fences are pending.
     fn need_snapshot(&self, time: u32) -> bool {
         if self.fence_pos != -1 {
             return false;
@@ -672,7 +674,8 @@ impl TexDriver {
         u64::from(time) > 500 + u64::from(last_time)
     }
 
-    /// `entry_data`: the document for the primary input, else what the engine wrote.
+    /// The bytes served for `entry`: the document for the primary input, else what the engine
+    /// wrote.
     fn entry_data(&self, entry: usize) -> &[u8] {
         if entry == PRIMARY {
             self.document.as_deref().unwrap_or_default()
@@ -685,7 +688,7 @@ impl TexDriver {
         self.cells.get(&fid).copied().ok_or(Violation)
     }
 
-    /// `answer_query` (`:530-980`) without the picture cache.
+    /// Answer one engine query.
     fn answer_query(&mut self, query: Query) -> Result<Option<Answer>, Violation> {
         let time = query.time;
         let answer = match query.body {
@@ -837,7 +840,7 @@ impl TexDriver {
         }
     }
 
-    /// `engine_step` (`:1204-1241`).
+    /// Serve the top process's next query, waiting up to `poll` for it.
     fn engine_step(&mut self, poll: Duration) -> bool {
         let Some(process) = self.processes.last_mut() else {
             return false;
@@ -876,9 +879,9 @@ impl TexDriver {
         true
     }
 
-    // Rollback (`:984-1147`, `:1310-1473`) --------------------------------------------------
+    // Rollback --------------------------------------------------------------------------------
 
-    /// `rollback_processes`.
+    /// Pop every process that saw past trace position `trace`, then rewind the trace.
     fn rollback_processes(&mut self, reverted: usize, trace: i64) {
         self.stats.rollbacks += 1;
         while self
@@ -907,7 +910,8 @@ impl TexDriver {
         entry.seen != SEEN_MISSING && entry.seen != SEEN_UNSET && self.entries[entry.entry].input
     }
 
-    /// `compute_fences`: returns the trace position processes roll back to (may be -1).
+    /// Place fences before the change at `offset`; returns the trace position processes roll
+    /// back to (may be -1).
     fn compute_fences(&mut self, trace: usize, offset: i64) -> i64 {
         self.fence_pos = -1;
         if trace == 0 {
@@ -955,7 +959,7 @@ impl TexDriver {
         trace
     }
 
-    /// `rollback_begin`.
+    /// Open a change transaction at the top process's trace length.
     fn rollback_begin(&mut self) {
         self.transaction = self.processes.last().map(|process| Transaction {
             trace_len: process.trace_len,
@@ -964,17 +968,16 @@ impl TexDriver {
         });
     }
 
-    /// `process_pending_messages`: false if the process may have observed more than recorded.
+    /// Bring the top process's view up to date before a change at `changed`; false if it may
+    /// have observed more than recorded.
     ///
-    /// Deviation from `engine_tex.c:1395-1432`: texpresso kills a top process that sends nothing
-    /// within 10 ms of a change, since it may have consumed changed bytes without reporting them.
-    /// There, every file read is a driver query and acts as a heartbeat; here bundle files are
-    /// read locally, so a root busy with the preamble is silent for much longer and would be
-    /// killed (and respawned) on every keystroke. Instead the change is *deferred*: `FLSH` is
-    /// sent (the engine discards its buffered bytes and re-reads from its true position) and the
-    /// process's next message settles it, because the engine always flushes a pending `SEEN`
-    /// before any other query (see `engine_step`). Only a process silent for [`STUCK_AFTER`] is
-    /// still killed: texpresso's protection against engines stuck in an infinite loop.
+    /// A top process that sends nothing may have consumed changed bytes without reporting them.
+    /// Bundle files are read inside the engine, so a root busy with the preamble can stay silent
+    /// for a long time, and killing it on every keystroke would restart it forever. Instead the
+    /// change is *deferred*: `FLSH` is sent (the engine discards its buffered bytes and re-reads
+    /// from its true position) and the process's next message settles it, because the engine
+    /// always flushes a pending `SEEN` before any other query (see `engine_step`). Only a process
+    /// silent for [`STUCK_AFTER`] is killed, since it is likely stuck in an infinite loop.
     fn process_pending_messages(&mut self, entry: usize, changed: i64) -> bool {
         let Some(transaction) = self.transaction else {
             return true;
@@ -1045,7 +1048,8 @@ impl TexDriver {
         nothing_seen
     }
 
-    /// `rollback_add_change`.
+    /// Record a change at `changed` in `entry`: rewind the trace to before the first observation
+    /// that saw it.
     fn rollback_add_change(&mut self, entry: usize, changed: i64) {
         let Some(transaction) = self.transaction else {
             return;
@@ -1075,7 +1079,7 @@ impl TexDriver {
         }
     }
 
-    /// `rollback_end`: `Some((trace, offset))` when processes must roll back.
+    /// Close the transaction: `Some((trace, offset))` when processes must roll back.
     fn rollback_end(&mut self) -> Option<(usize, i64)> {
         let transaction = self.transaction.take()?;
         let top = self.top();

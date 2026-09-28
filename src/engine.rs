@@ -1,15 +1,15 @@
-//! The TeX engine helper process (texpresso-xetex's role), started as
-//! `<exe> --tex-engine <cache_dir>` with its driver channel on fd 3.
+//! The TeX engine helper process, started as `<exe> --tex-engine <cache_dir>` with its driver
+//! channel on fd 3.
 //!
 //! It runs Tectonic's XeTeX through our own [`DriverHooks`] / [`IoProvider`]:
 //! - the primary input `mathnote.tex` is read through the driver with `READ`/`SEEN`, and a `FORK`
-//!   answer turns the process into a snapshot (texpresso `main.c`, `texpresso_protocol.c`,
-//!   `fork.c`);
+//!   answer turns the process into a snapshot: the parent stays suspended and the child
+//!   continues;
 //! - every output (xdv, synctex.gz, log, aux, stdout) and the status stream `mathnote.status` is
 //!   appended to the driver;
 //! - every other input is asked from the driver first (it serves outputs written earlier, such
-//!   as `mathnote.aux`); bundle files and the format are served locally, read fully into memory on open so no file
-//!   offset is shared across `fork`.
+//!   as `mathnote.aux`); bundle files and the format are served locally, read fully into memory
+//!   on open so no file offset is shared across `fork`.
 //!
 //! The process must stay single-threaded because it forks.
 
@@ -46,9 +46,9 @@ pub const PRIMARY_INPUT_NAME: &str = "mathnote.tex";
 /// Pseudo output carrying `kind\tmessage` status lines.
 pub const STATUS_OUTPUT_NAME: &str = "mathnote.status";
 
-/// `BUF_SIZE` of `texpresso_protocol.c`.
+/// Appends are coalesced up to this many bytes before they are sent.
 const APPEND_BUFFER: usize = 4096;
-/// `txp_input::buffer` size (`main.c:137`).
+/// Bytes of the primary input asked for per `READ`.
 const INPUT_BUFFER: usize = 1024;
 
 /// The driver is gone (EOF / EPIPE): nothing left to do, exit silently.
@@ -57,7 +57,7 @@ fn driver_gone() -> ! {
     unsafe { libc::_exit(0) }
 }
 
-/// `txp_client`: the engine side of the protocol.
+/// The engine side of the protocol: coalesces `SEEN` and appends, and forks on request.
 struct Client {
     chan: EngineChannel,
     generation: u32,
@@ -68,7 +68,7 @@ struct Client {
     next_fid: i32,
     open_fids: Vec<i32>,
     /// Active engine time. Time blocked on the driver (answers, `waitpid` as a snapshot) is
-    /// excluded; this replaces texpresso's patched-in `xetex_tokens` counter.
+    /// excluded, so snapshots are spaced by work done rather than by wall time.
     active: Duration,
     running_since: Option<Instant>,
 }
@@ -76,7 +76,7 @@ struct Client {
 type Shared = Rc<RefCell<Client>>;
 
 impl Client {
-    /// `txp_connect`.
+    /// Greet the driver on channel `fd`.
     fn connect(fd: i32) -> Self {
         let mut chan = EngineChannel::new(fd);
         chan.send_raw(CLIENT_HANDSHAKE);
@@ -140,7 +140,7 @@ impl Client {
         self.resume();
     }
 
-    /// `txp_io_recv_tag`: every `FLSH` bumps the generation.
+    /// The next answer tag; every `FLSH` before it bumps the generation.
     fn recv_tag(&mut self) -> u32 {
         self.pause();
         let (tag, flushes) = self.chan.recv_tag().unwrap_or_else(|_| driver_gone());
@@ -162,7 +162,7 @@ impl Client {
         self.chan.send_u32(time);
     }
 
-    /// `txp_flush_pending`.
+    /// Send the coalesced `SEEN` and appends.
     fn flush_pending(&mut self) {
         if self.seen_pos != 0 {
             self.send_tag_raw(Q_SEEN);
@@ -181,13 +181,13 @@ impl Client {
         }
     }
 
-    /// `txp_io_send_tag`.
+    /// Send a query tag after everything pending.
     fn send_tag(&mut self, tag: u32) {
         self.flush_pending();
         self.send_tag_raw(tag);
     }
 
-    /// `txp_seen`.
+    /// Note that the engine has consumed `fid` up to `pos`; sent with the next query.
     fn seen(&mut self, fid: i32, pos: u32) {
         if self.seen_fid != fid {
             self.flush_pending();
@@ -198,7 +198,7 @@ impl Client {
         }
     }
 
-    /// `txp_open`.
+    /// Ask the driver to open `path`; `None` when it does not serve the file.
     fn open(&mut self, fid: i32, path: &str, write: bool) -> Option<String> {
         self.send_tag(if write { Q_OPWR } else { Q_OPRD });
         self.chan.send_i32(fid);
@@ -216,7 +216,7 @@ impl Client {
         }
     }
 
-    /// `txp_read` (`texpresso_protocol.c:257-287`): a `FORK` answer forks, then re-asks.
+    /// Read `fid` at `pos`: a `FORK` answer forks, then the read is asked again.
     fn read(&mut self, fid: i32, pos: u32, buf: &mut [u8]) -> usize {
         loop {
             self.send_tag(Q_READ);
@@ -241,7 +241,7 @@ impl Client {
         }
     }
 
-    /// `txp_append`.
+    /// Append `data` to output `fid`, coalescing small writes.
     fn append(&mut self, fid: i32, data: &[u8]) {
         if data.is_empty() {
             return;
@@ -262,7 +262,7 @@ impl Client {
         self.check_done();
     }
 
-    /// `txp_close`.
+    /// Close output `fid`.
     fn close(&mut self, fid: i32) {
         if let Some(index) = self.open_fids.iter().position(|&open| open == fid) {
             self.open_fids.swap_remove(index);
@@ -293,7 +293,8 @@ impl Client {
         self.recv_u32()
     }
 
-    /// `txp_fork` + `texpresso_fork_with_channel` (`fork.c:58-124`).
+    /// Become a snapshot: the child continues on a fresh channel handed to the driver, and the
+    /// parent stays suspended until that child exits, then resumes where it forked.
     fn fork(&mut self) {
         self.generation = self.generation.wrapping_add(1);
         self.flush_pending();
@@ -374,9 +375,9 @@ fn wait_child(child: Pid) {
     }
 }
 
-/// `txp_input` (`main.c:370-560`): a file served by the driver (the primary document, or an
-/// output the engine wrote earlier, such as `mathnote.aux`).
-struct TxpInput {
+/// A file served by the driver (the primary document, or an output the engine wrote earlier,
+/// such as `mathnote.aux`), read through a local buffer with `READ`/`SEEN`.
+struct DriverInput {
     client: Shared,
     id: i32,
     file_size: Option<u32>,
@@ -387,7 +388,7 @@ struct TxpInput {
     buffer: [u8; INPUT_BUFFER],
 }
 
-impl Read for TxpInput {
+impl Read for DriverInput {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
         if out.is_empty() {
             return Ok(0);
@@ -418,7 +419,7 @@ impl Read for TxpInput {
     }
 }
 
-impl InputFeatures for TxpInput {
+impl InputFeatures for DriverInput {
     fn get_size(&mut self) -> tectonic::Result<usize> {
         if self.file_size.is_none() {
             self.file_size = Some(self.client.borrow_mut().size(self.id));
@@ -445,19 +446,19 @@ impl InputFeatures for TxpInput {
     }
 }
 
-impl Drop for TxpInput {
+impl Drop for DriverInput {
     fn drop(&mut self) {
         self.client.borrow_mut().close(self.id);
     }
 }
 
 /// An output whose writes become buffered `APND` messages; dropping it sends `CLOS`.
-struct TxpOutput {
+struct DriverOutput {
     client: Shared,
     fid: i32,
 }
 
-impl Write for TxpOutput {
+impl Write for DriverOutput {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.client.borrow_mut().append(self.fid, buf);
         Ok(buf.len())
@@ -468,7 +469,7 @@ impl Write for TxpOutput {
     }
 }
 
-impl Drop for TxpOutput {
+impl Drop for DriverOutput {
     fn drop(&mut self) {
         if self.fid != STDOUT_FID {
             self.client.borrow_mut().close(self.fid);
@@ -499,7 +500,7 @@ impl IoProvider for EngineIo {
         match client.open(fid, name, true) {
             Some(_) => OpenResult::Ok(OutputHandle::new(
                 name,
-                TxpOutput {
+                DriverOutput {
                     client: Rc::clone(&self.client),
                     fid,
                 },
@@ -511,14 +512,14 @@ impl IoProvider for EngineIo {
     fn output_open_stdout(&mut self) -> OpenResult<OutputHandle> {
         OpenResult::Ok(OutputHandle::new(
             "stdout",
-            TxpOutput {
+            DriverOutput {
                 client: Rc::clone(&self.client),
                 fid: STDOUT_FID,
             },
         ))
     }
 
-    /// Ask the driver first (`main.c:226-249`), then the bundle.
+    /// Ask the driver first, then the bundle.
     fn input_open_name(
         &mut self,
         name: &str,
@@ -560,7 +561,7 @@ impl EngineIo {
         let generation = client.generation;
         Some(InputHandle::new(
             name,
-            TxpInput {
+            DriverInput {
                 client: Rc::clone(&self.client),
                 id,
                 file_size: None,

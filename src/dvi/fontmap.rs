@@ -1,6 +1,6 @@
 //! `pdftex.map`: which Type1 file, encoding and effects draw a TFM font.
 //!
-//! Mirrors texpresso's `tex_fontmap.c` line grammar:
+//! Line grammar:
 //! `tfmname [psname] ["snippet"] [<[encfile.enc] [<fontfile.pfb]`, where `<<` and `<[` mark
 //! the same files, `%` starts a comment line, and any other token rejects the line. The map is
 //! several megabytes, so it is indexed once by first token and a line is only parsed when its
@@ -95,7 +95,7 @@ fn parse_rest(rest: &[u8]) -> Option<MapEntry> {
             apply_snippet(&mut entry, &snippet[..end]);
             cursor = &snippet[end + 1..];
         } else {
-            // Anything but a snippet or a `<file` rejects the line, as in texpresso.
+            // Anything but a snippet or a `<file` rejects the line.
             let file = cursor.strip_prefix('<')?;
             let file = file.trim_start_matches([' ', '\t']);
             let file = file.strip_prefix(['[', '<']).unwrap_or(file);

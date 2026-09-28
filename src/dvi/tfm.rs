@@ -1,8 +1,8 @@
 //! TeX font metric (TFM) files: the character widths `set_char` advances by.
 //!
-//! Mirrors texpresso's `tex_tfm.c`: the header words give the table sizes, the char-info word of
-//! each code in `bc..=ec` indexes the width table, and every width is a `fix_word` scaled to the
-//! DVI font's size with DVItype's exact integer algorithm.
+//! The header words give the table sizes, the char-info word of each code in `bc..=ec` indexes
+//! the width table, and every width is a `fix_word` scaled to the DVI font's size with DVItype's
+//! exact integer algorithm.
 
 /// Parsed widths of one TFM file. Only what the DVI interpreter needs is kept.
 #[derive(Debug, Clone, PartialEq, Eq)]

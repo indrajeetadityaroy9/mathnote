@@ -1,4 +1,4 @@
-//! The live preview pipeline on one background thread of the editor: texpresso's driver.
+//! The live preview pipeline on one background thread of the editor: the snapshot driver.
 //!
 //! The thread owns the snapshot engine ([`TexDriver`]), the incremental XDV document, the font
 //! store and SyncTeX. It receives each revision's LaTeX and the page the preview pane shows, and

@@ -1,8 +1,7 @@
 //! Wire format shared by the TeX engine helper (`--tex-engine`) and [`crate::driver`].
 //!
-//! This mirrors texpresso's `sprotocol.h` / `texpresso_protocol.c`:
 //! - the engine sends *queries*: `tag u32` + `time u32` + fields, all little-endian, with
-//!   `PACK(a,b,c,d)` tags; strings are `u32 len` + bytes;
+//!   four-character tags; strings are `u32 len` + bytes;
 //! - the driver replies with *answers* (`DONE`, `PASS`, `SIZE`, `MTIM`, `READ`, `FORK`, `OPEN`)
 //!   and may interleave the *ask* `FLSH`, which the engine consumes while waiting for an answer;
 //! - `CHLD` carries a child pid plus the child's socket end through `SCM_RIGHTS`.
@@ -20,7 +19,7 @@ use nix::libc;
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sys::socket::{ControlMessage, ControlMessageOwned, MsgFlags, UnixAddr, recvmsg, sendmsg};
 
-/// `PACK(a,b,c,d)` from `sprotocol.h`: the four characters read as a little-endian `u32`.
+/// A four-character tag read as a little-endian `u32`.
 pub const fn pack(tag: [u8; 4]) -> u32 {
     u32::from_le_bytes(tag)
 }
@@ -45,10 +44,10 @@ pub const A_OPEN: u32 = pack(*b"OPEN");
 
 pub const C_FLSH: u32 = pack(*b"FLSH");
 
-/// Engine → driver greeting (`txp_connect`).
-pub const CLIENT_HANDSHAKE: &[u8; 12] = b"TEXPRESSOC01";
+/// Engine → driver greeting.
+pub const CLIENT_HANDSHAKE: &[u8; 12] = b"MATHNOTEE001";
 /// Driver → engine greeting.
-pub const SERVER_HANDSHAKE: &[u8; 12] = b"TEXPRESSOS01";
+pub const SERVER_HANDSHAKE: &[u8; 12] = b"MATHNOTED001";
 
 /// File id used by appends to the engine's standard output.
 pub const STDOUT_FID: i32 = -1;
@@ -155,7 +154,7 @@ pub fn read_exact_fd(fd: BorrowedFd<'_>, mut buf: &mut [u8]) -> io::Result<()> {
     Ok(())
 }
 
-/// `send_child_fd` (`fork.c:30-56`): `CHLD` + time + pid, with `child_fd` as `SCM_RIGHTS`.
+/// Send `CHLD` + time + pid, with `child_fd` passed as `SCM_RIGHTS`.
 pub fn send_child(fd: BorrowedFd<'_>, time: u32, pid: i32, child_fd: RawFd) -> io::Result<()> {
     let tag = Q_CHLD.to_le_bytes();
     let time = time.to_le_bytes();
@@ -240,7 +239,7 @@ impl EngineChannel {
         read_exact_fd(self.fd(), buf)
     }
 
-    /// `txp_io_recv_tag`: returns the next answer tag and how many `FLSH` asks preceded it.
+    /// The next answer tag, and how many `FLSH` asks preceded it.
     pub fn recv_tag(&mut self) -> io::Result<(u32, u32)> {
         let mut flushes = 0;
         loop {
