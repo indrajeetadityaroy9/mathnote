@@ -6,6 +6,7 @@ use ratatui::widgets::{
     Block, BorderType, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
     Wrap,
 };
+use unicode_width::UnicodeWidthStr;
 
 use crate::App;
 use crate::app::PaneFocus;
@@ -23,7 +24,7 @@ pub(crate) fn render(frame: &mut Frame, app: &mut App) {
         Constraint::Fill(1),
         Constraint::Length(1),
     ]));
-    let panes = layout::split(content_area, app.focus(), app.zen_mode());
+    let panes = layout::split(content_area, app.focus());
 
     app.configure_pane_areas(panes.source, panes.latex, panes.preview);
     let source_inner = render_source(frame, app, panes.source, &theme);
@@ -195,18 +196,17 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) {
 
     let hints = if area.width >= 100 {
         match app.focus() {
-            PaneFocus::Source => " F1 HELP │ F2 ZEN │ F6 PANES │ TAB INDENT ",
-            PaneFocus::Latex => " F1 HELP │ H/L PANES │ J/K SCROLL │ HOME/END ",
+            PaneFocus::Source => " F1 HELP │ F6 PANES │ PGUP/PGDN PAGE ",
+            PaneFocus::Latex => " F1 HELP │ H/L PANES │ J/K SCROLL ",
             PaneFocus::Preview => " F1 HELP │ H/L PANES │ J/K SCROLL │ PGUP/PGDN PAGE ",
         }
-    } else if area.width >= 72 {
-        " F1 HELP │ F2 ZEN │ F6 PANES "
     } else if area.width >= 50 {
         " F1 HELP │ F6 PANES "
     } else {
         ""
     };
-    let hint_width = u16::try_from(hints.len())
+    // Display columns, not bytes: each `│` is three bytes but one column.
+    let hint_width = u16::try_from(hints.width())
         .unwrap_or(u16::MAX)
         .min(area.width);
     let [left, right] = area.layout(&Layout::horizontal([
@@ -226,7 +226,7 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     };
     let separator = || Span::styled(" │ ", Style::default().fg(theme.inactive));
     let mut spans = vec![Span::styled(
-        if app.zen_mode() { " ZEN " } else { " EDIT " },
+        " EDIT ",
         Style::default()
             .fg(theme.background)
             .bg(theme.accent)
@@ -282,7 +282,6 @@ fn render_help(frame: &mut Frame, theme: &Theme) {
     let help = Text::from(vec![
         help_heading("GLOBAL", theme),
         help_binding("F1", "toggle command reference", theme),
-        help_binding("F2", "toggle distraction-free zen mode", theme),
         help_binding("F6 / Shift-F6", "cycle panes forward / backward", theme),
         help_binding("Esc / Ctrl-C", "quit mathnote", theme),
         help_heading("EDITOR", theme),
@@ -429,7 +428,9 @@ mod tests {
         assert!(screen.contains("EDIT"));
         assert!(screen.contains("SOURCE"));
         assert!(screen.contains("F1 HELP"));
-        assert!(screen.contains("TAB INDENT"));
+        let status_row = screen.lines().last().expect("status row");
+        assert!(status_row.ends_with(" F1 HELP │ F6 PANES │ PGUP/PGDN PAGE "));
+        assert!(!screen.contains("ZEN"));
         assert!(!screen.contains("natural-language mathematics"));
     }
 

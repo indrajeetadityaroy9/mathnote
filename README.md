@@ -14,10 +14,9 @@ cargo run
 
 ## Interface
 
-Wide terminals show the source, generated LaTeX, and rendered document together. Narrow terminals stack the panes, while very small terminals and zen mode show only the focused pane.
+Wide terminals show the source, generated LaTeX, and rendered document together. Narrow terminals stack the panes, while very small terminals show only the focused pane.
 
 - `F1`: command reference
-- `F2`: toggle distraction-free zen mode
 - `F6` / `Shift-F6`: cycle panes
 - `h` / `l`: move between inspector panes
 - `j` / `k`, arrows, `Home`, `End`: navigate or scroll

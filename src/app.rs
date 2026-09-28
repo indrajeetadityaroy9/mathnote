@@ -51,7 +51,6 @@ pub struct App {
     buffer: TextBuffer,
     should_quit: bool,
     show_help: bool,
-    zen_mode: bool,
     focus: PaneFocus,
     revision: u64,
     generated_revision: Option<u64>,
@@ -206,7 +205,6 @@ impl App {
             buffer: TextBuffer::default(),
             should_quit: false,
             show_help: false,
-            zen_mode: false,
             focus: PaneFocus::Source,
             revision: 1,
             generated_revision: None,
@@ -359,11 +357,6 @@ impl App {
             if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
                 self.show_help = false;
             }
-            return;
-        }
-
-        if key.code == KeyCode::F(2) {
-            self.zen_mode = !self.zen_mode;
             return;
         }
 
@@ -1096,10 +1089,6 @@ impl App {
         self.caret = caret;
     }
 
-    pub(crate) fn zen_mode(&self) -> bool {
-        self.zen_mode
-    }
-
     pub(crate) fn cursor_line_column(&self) -> (usize, usize) {
         self.buffer.cursor_line_column()
     }
@@ -1360,16 +1349,6 @@ mod tests {
         assert_eq!(app.focus(), PaneFocus::Preview);
         app.handle_key(press(KeyCode::Char('h')));
         assert_eq!(app.focus(), PaneFocus::Latex);
-    }
-
-    #[test]
-    fn f2_toggles_distraction_free_zen_mode() {
-        let mut app = App::default();
-        assert!(!app.zen_mode());
-        app.handle_key(press(KeyCode::F(2)));
-        assert!(app.zen_mode());
-        app.handle_key(press(KeyCode::F(2)));
-        assert!(!app.zen_mode());
     }
 
     #[test]
