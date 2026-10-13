@@ -15,14 +15,19 @@ image = { version = "0.25", default-features = false }
 kurbo = "0.13"
 nix = { version = "0.31", features = ["socket", "process", "signal", "uio", "fs", "poll"] }
 ratatui = "0.30"
-ratatui-image = { version = "11.0.8", default-features = false, features = ["crossterm", "image-defaults"] }
+ratatui-image = { version = "11.0.8", default-features = false, features = ["crossterm"] }
 ropey = "1.6.1"
 skrifa = "0.42.1"
-tectonic = { version = "0.17.0", default-features = false, features = ["geturl-reqwest"] }
+tectonic = { version = "0.17.0", default-features = false, features = ["geturl-curl"] }
 tectonic_bridge_core = "0.5.3"
-tectonic_bundles = { version = "0.4.2", default-features = false, features = ["geturl-reqwest"] }
+tectonic_bundles = { version = "0.4.2", default-features = false, features = ["geturl-curl"] }
 unicode-width = "0.2"
 vello_cpu = { version = "0.0.8", default-features = false, features = ["std", "u8_pipeline"] }
+
+[profile.release]
+strip = "symbols"
+lto = "thin"
+codegen-units = 4
 
 [profile.dev]
 opt-level = 1
