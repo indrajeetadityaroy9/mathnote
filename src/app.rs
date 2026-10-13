@@ -12,7 +12,7 @@ use crossterm::event::{
 };
 use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
 use crossterm::{execute, queue};
-use image::{ImageBuffer, Rgba, RgbaImage, imageops};
+use image::Rgba;
 use ratatui::DefaultTerminal;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect, Size};
@@ -21,7 +21,7 @@ use ratatui_image::picker::Picker;
 use crate::document::{Document, SourceSpan, TextBuffer, map_offset_across_edit};
 use crate::latex::{LatexDocument, emit_latex};
 use crate::preview::{PreviewCommand, PreviewEvent, RenderedPage, preview_thread};
-use crate::strips::{EncodedStrips, StripPreview};
+use crate::strips::{Canvas, EncodedStrips, StripPreview};
 use crate::synctex::{SyncIndex, SyncTarget};
 use crate::theme::Theme;
 use crate::ui;
@@ -734,8 +734,8 @@ impl App {
         self.install_visible_preview();
     }
 
-    /// Crop the visible rows of the page, tint the highlighted lines, and hand the canvas to the
-    /// strip encoder.
+    /// Hand the visible rows of the page and the highlight to the strip encoder, which composes,
+    /// compares and encodes them off the UI thread.
     fn install_visible_preview(&mut self) {
         let Some(page) = &self.page else {
             return;
@@ -765,30 +765,17 @@ impl App {
             return;
         }
 
-        let crop_height = viewport_height.min(image.height().saturating_sub(y)).max(1);
-        let cropped =
-            imageops::crop_imm(image.as_ref(), 0, y, image.width(), crop_height).to_image();
-        let mut canvas =
-            ImageBuffer::from_pixel(image.width(), viewport_height, Rgba([255, 255, 255, 255]));
-        imageops::replace(&mut canvas, &cropped, 0, 0);
-        if let (Some((top, bottom)), Some(accent)) = (self.highlight, Theme::default().accent_rgb())
-            && bottom > y
-        {
-            for row in top.saturating_sub(y)..(bottom - y).min(viewport_height) {
-                for column in 0..canvas.width() {
-                    let pixel = canvas.get_pixel_mut(column, row);
-                    for (channel, tint) in pixel.0.iter_mut().zip(accent) {
-                        *channel = (u16::from(*channel) * u16::from(tint) / 255) as u8;
-                    }
-                }
-            }
-        }
-        let canvas = fit_to_width(
-            canvas,
-            u32::from(self.preview_size.width) * u32::from(font.width),
-            font_height,
+        self.strips.install(
+            key,
+            Canvas {
+                page: Arc::clone(&page.image),
+                top: y,
+                height: viewport_height,
+                highlight: self.highlight,
+                tint: Theme::default().accent_rgb(),
+                max_width: u32::from(self.preview_size.width) * u32::from(font.width),
+            },
         );
-        self.strips.install(key, &canvas);
     }
 
     fn scroll_preview(&mut self, rows: i16) {
@@ -1173,25 +1160,6 @@ impl App {
     }
 }
 
-/// Scale a canvas wider than `max_width` pixels down to that width, then pad it with white to
-/// whole cell rows so it splits into strips. Only a page rendered for an older, wider pane is
-/// ever too wide.
-fn fit_to_width(canvas: RgbaImage, max_width: u32, font_height: u32) -> RgbaImage {
-    if canvas.width() <= max_width || max_width == 0 {
-        return canvas;
-    }
-    let ratio = f64::from(max_width) / f64::from(canvas.width());
-    let height = (f64::from(canvas.height()) * ratio).round().max(1.0) as u32;
-    let scaled = imageops::resize(&canvas, max_width, height, imageops::FilterType::Triangle);
-    let mut padded = ImageBuffer::from_pixel(
-        max_width,
-        height.div_ceil(font_height) * font_height,
-        Rgba([255, 255, 255, 255]),
-    );
-    imageops::replace(&mut padded, &scaled, 0, 0);
-    padded
-}
-
 fn contains(area: Rect, column: u16, row: u16) -> bool {
     area.width > 0
         && area.height > 0
@@ -1222,6 +1190,7 @@ fn spawn_terminal_reader(events: mpsc::Sender<LoopEvent>) {
 mod tests {
     use super::*;
     use crate::driver::TexMessage;
+    use image::ImageBuffer;
 
     fn press(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -1507,6 +1476,11 @@ mod tests {
         ))));
         wait_for_encoded_strips(&mut app);
         assert!(app.has_preview());
+        assert_eq!(
+            app.strips.last_encoded().len(),
+            8,
+            "the first install encodes every strip"
+        );
 
         let mut page = ImageBuffer::from_pixel(width, height, Rgba([255, 255, 255, 255]));
         let row_top = 3 * u32::from(font.height);
@@ -1519,8 +1493,13 @@ mod tests {
         changed.image = Arc::new(page);
         app.handle_loop_event(LoopEvent::Preview(PreviewEvent::Page(changed)));
 
-        assert_eq!(app.strips.staged_strips(), Some(&[3][..]));
+        assert!(app.strips.is_staging());
+        assert!(
+            app.has_preview(),
+            "the shown strips stay while the new ones are encoded"
+        );
         wait_for_encoded_strips(&mut app);
+        assert_eq!(app.strips.last_encoded(), &[3]);
         assert!(app.has_preview());
     }
 

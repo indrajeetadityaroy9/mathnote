@@ -159,6 +159,8 @@ pub struct TexDriver {
     transaction: Option<Transaction>,
     verification: Option<Verification>,
     xdv_truncation: Option<usize>,
+    /// Offset of the primary input at which every fresh root forks a snapshot.
+    root_snapshot: Option<i64>,
     spawn_error: Option<String>,
     stats: DriverStats,
 }
@@ -186,6 +188,7 @@ impl TexDriver {
             transaction: None,
             verification: None,
             xdv_truncation: None,
+            root_snapshot: None,
             spawn_error: None,
             stats: DriverStats::default(),
         };
@@ -219,6 +222,16 @@ impl TexDriver {
             None => changed as i64,
         };
         self.apply_change(PRIMARY, changed);
+    }
+
+    /// Make every fresh root process fork a snapshot when it reaches `offset` of the primary
+    /// input.
+    ///
+    /// Without it, a root that finishes in less than the snapshot interval leaves no snapshot,
+    /// so the next edit restarts from scratch. With `offset` at the end of a preamble that every
+    /// revision shares, any edit after it resumes from that snapshot instead.
+    pub fn set_root_snapshot(&mut self, offset: usize) {
+        self.root_snapshot = Some(offset as i64);
     }
 
     /// One change transaction: open it, add the change, close it, place fences, and roll the
@@ -492,6 +505,22 @@ impl TexDriver {
             killed: false,
             last_heard: Instant::now(),
         });
+        if let Some(offset) = self.root_snapshot {
+            self.add_root_fence(offset);
+        }
+    }
+
+    /// Fence the fresh root at `offset`, before any fences already placed nearer a change.
+    /// Fences form a stack whose top (`fence_pos`) is the earliest position, read first.
+    fn add_root_fence(&mut self, offset: i64) {
+        let earliest = self.fence_pos < 0 || self.fences[self.fence_pos as usize].position > offset;
+        if earliest && self.fence_pos < MAX_FENCES as i32 - 1 {
+            self.fence_pos += 1;
+            self.fences[self.fence_pos as usize] = Fence {
+                entry: PRIMARY,
+                position: offset,
+            };
+        }
     }
 
     fn spawn_root(&mut self) -> std::io::Result<(i32, Option<DriverChannel>)> {

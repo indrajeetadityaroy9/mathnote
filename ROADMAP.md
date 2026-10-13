@@ -14,7 +14,7 @@ Priorities:
 | P4 | Feature gaps that only matter if the LaTeX template grows |
 
 Suggested order: P0.1–P0.3 in one commit (only `Cargo.toml` changes, already measured), then
-P2.1–P2.3, then P1.1–P1.3, then P3, then P4 as needed.
+P2.1–P2.5, then P1.1–P1.3, then P3, then P4 as needed.
 
 ## Baseline
 
@@ -136,6 +136,25 @@ codegen-units = 4
 
 ## P1 — latency on the typing path
 
+**Status: done.** Measured in release builds:
+
+| | Before | After P1 |
+|---|---|---|
+| UI-thread time per preview update (1280×1760 px) | 6.3–6.5 ms median | 0.003 ms |
+| Page update until its strips are on screen | 6.8–7.0 ms median | 1.5–1.6 ms |
+| First edit after launch (driver, release) | 100–300 ms | 4.2–5.0 ms |
+| First keystroke after a fresh launch (real binary in a pseudo-terminal) | 160–300 ms | 4–5 ms reported, 5–7 ms keystroke to ready |
+| First math page render after the startup page | 10–24 ms | 2.8–4.7 ms (math fonts preloaded in ~8–9 ms while idle) |
+
+Deviation from the plan in P1.1: rows are compared exactly, byte for byte, on the encoder thread
+against the shown rows (shared with it as `Arc<RgbaImage>`), instead of by hash. That costs no
+UI-thread time either and cannot miss a change through a hash collision.
+
+P1.2 was checked on macOS: the root forks at `BODY_SNAPSHOT_OFFSET` before any page is written,
+the first edit resumes from that snapshot without spawning a new root, and its XDV is
+byte-identical to a cold compile (`the_first_edit_after_the_blank_template_resumes_from_the_preamble_snapshot`
+in `tests/snapshot_driver.rs`); the burst-typing and stuck-engine tests still pass.
+
 ### P1.1 Move preview image preparation off the UI thread
 
 **Why.** On every rendered page and every highlight move, the UI thread copies and compares the
@@ -244,6 +263,31 @@ and engine, or wire `get_unix_mtime` to it if a real modification time is ever n
 inputs come from the immutable bundle or from the driver).
 
 **Verify.** `cargo clippy --all-targets` clean with no `#[allow(dead_code)]` left in `src/`.
+
+### P2.4 Cache the Type1 files of every math size the template uses
+
+**Why.** Found while measuring P1.3. The first-launch warm-up typesets `CACHE_WARMUP_NOTE`
+(`src/cache.rs`), which only uses math at text and script size, so only `cmr10`, `cmmi10`,
+`cmsy10`, `cmex10`, `cmr8` and `cmmi8` have their `.pfb` outline files cached. A note with
+script-script material (for example `$x squared over 2$` in display mathematics) uses `cmr6`,
+whose `.tfm` is cached (the engine typesets it) but whose `.pfb` is not. The renderer opens the
+bundle cache-only, so those glyphs are missing from the preview.
+
+**Change.** Extend the warm-up note with script-script and other sizes (`cmr6`, `cmmi6`,
+`cmsy6`, `cmsy8`, and the 5/7 pt sizes if reachable), or have the warm-up load the `.pfb` of every
+cached math `.tfm` named in `pdftex.map`. Bump the cache ready marker so existing caches refill.
+
+**Verify.** After the warm-up, every math `.tfm` in the cache has its `.pfb`; a note using
+script-script digits renders them (compare with the Tectonic PDF in `tests/dvi_render.rs`).
+
+### P2.5 Keep renderer warnings off the terminal
+
+**Why.** `FontStore::warn` (`src/dvi/fonts.rs`) and `XdvDocument::fail` (`src/dvi/xdv.rs`) write
+with `eprintln!`. While the TUI owns the terminal, stderr is the same terminal, so a warning (such
+as the missing `cmr6.pfb` above) is printed over the interface.
+
+**Change.** Collect these warnings in the pipeline and surface them in the status line or the
+help overlay instead of writing to stderr.
 
 ---
 

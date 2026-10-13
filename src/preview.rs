@@ -13,10 +13,14 @@ use crate::app::LoopEvent;
 use crate::cache::{cache_is_warmed, default_cache_dir, ensure_cache_warm};
 use crate::driver::{DriverConfig, EngineState, TexDriver, TexMessage};
 use crate::dvi::{BundleFontFiles, FontStore, XdvDocument, render_page};
+use crate::latex::BODY_SNAPSHOT_OFFSET;
 use crate::synctex::SyncIndex;
 
 /// How long one engine step may serve queries before new commands are looked at.
 const ENGINE_STEP: Duration = Duration::from_millis(8);
+
+/// TFM fonts of the template's mathematics at text and script size (11 pt article).
+const PRELOADED_MATH_FONTS: &[&str] = &["cmr10", "cmmi10", "cmsy10", "cmex10", "cmr8", "cmmi8"];
 
 pub(crate) enum PreviewCommand {
     /// The complete LaTeX source of a revision.
@@ -67,13 +71,14 @@ pub(crate) fn preview_thread(
         .and_then(|()| BundleFontFiles::open(&cache_dir))
         .and_then(|files| {
             let engine_exe = std::env::current_exe().map_err(|error| error.to_string())?;
-            Ok((
-                TexDriver::new(DriverConfig {
-                    engine_exe,
-                    cache_dir: cache_dir.clone(),
-                }),
-                FontStore::new(Box::new(files)),
-            ))
+            let mut driver = TexDriver::new(DriverConfig {
+                engine_exe,
+                cache_dir: cache_dir.clone(),
+            });
+            // Snapshot every fresh engine at the end of the shared preamble, so even the first
+            // edit after launch resumes there instead of typesetting from scratch.
+            driver.set_root_snapshot(BODY_SNAPSHOT_OFFSET);
+            Ok((driver, FontStore::new(Box::new(files))))
         });
     let (driver, fonts) = match setup {
         Ok(setup) => setup,
@@ -93,6 +98,7 @@ pub(crate) fn preview_thread(
         reported: None,
         view: None,
         rendered: None,
+        fonts_preloaded: false,
     };
     pipeline.run(&commands);
 }
@@ -111,6 +117,8 @@ struct Pipeline<'a> {
     view: Option<(usize, u32)>,
     /// What was last rendered for the view: page, width, fingerprint.
     rendered: Option<(usize, u32, u64)>,
+    /// Whether the template's math fonts have been loaded ahead of use.
+    fonts_preloaded: bool,
 }
 
 impl Pipeline<'_> {
@@ -120,6 +128,11 @@ impl Pipeline<'_> {
             let command = if running {
                 commands.try_recv().ok()
             } else {
+                // Idle after a run: load the math fonts now rather than on the first page that
+                // needs them (not before the first run, which would delay it).
+                if self.driver.state() == EngineState::Finished {
+                    self.preload_fonts();
+                }
                 match commands.recv() {
                     Ok(command) => Some(command),
                     Err(_) => return,
@@ -156,6 +169,16 @@ impl Pipeline<'_> {
     fn update_pages(&mut self) {
         let truncated = self.driver.take_xdv_truncation();
         self.xdv.update(self.driver.xdv(), truncated);
+    }
+
+    /// Load the classic math fonts the template uses at text and script size once, while the
+    /// engine is idle. The cache bootstrap typesets them, so their files are always cached; the
+    /// text font is loaded by the first page render.
+    fn preload_fonts(&mut self) {
+        if !self.fonts_preloaded {
+            self.fonts_preloaded = true;
+            self.fonts.preload(PRELOADED_MATH_FONTS, &[]);
+        }
     }
 
     /// Render the viewed page when it or the view changed; `false` once the editor is gone.

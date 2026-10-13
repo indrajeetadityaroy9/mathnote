@@ -108,6 +108,20 @@ impl FontStore {
         }
     }
 
+    /// Load the metrics, outline files and encodings of the TFM fonts `tfm_names`, and the
+    /// native font files `native_names` (face 0), before a page first uses them, so that page
+    /// renders without the loading delay. A font that cannot be loaded is reported once, as on
+    /// first use.
+    pub fn preload(&mut self, tfm_names: &[&str], native_names: &[&str]) {
+        for name in tfm_names {
+            self.tfm(name);
+            self.face_by_key(FaceKey::Tfm((*name).to_owned()));
+        }
+        for name in native_names {
+            self.face_by_key(FaceKey::Native((*name).to_owned(), 0));
+        }
+    }
+
     /// Advance of `code` in DVI units; 0 for native fonts and missing metrics.
     pub(crate) fn tfm_width(&mut self, def: &FontDef, code: u32) -> i32 {
         let FontDef::Tfm { name, scale, .. } = def else {
@@ -161,6 +175,10 @@ impl FontStore {
             FontDef::Tfm { name, .. } => FaceKey::Tfm(name.clone()),
             FontDef::Native { name, index, .. } => FaceKey::Native(name.clone(), *index),
         };
+        self.face_by_key(key)
+    }
+
+    fn face_by_key(&mut self, key: FaceKey) -> Option<usize> {
         if let Some(face) = self.faces.get(&key) {
             return *face;
         }

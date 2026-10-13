@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use mathnote::cache::{default_cache_dir, ensure_cache_warm};
 use mathnote::document::Document;
 use mathnote::driver::{DriverConfig, EngineState, TexDriver};
-use mathnote::latex::{LatexDocument, emit_latex};
+use mathnote::latex::{BODY_SNAPSHOT_OFFSET, LatexDocument, emit_latex};
 use mathnote::synctex::SyncIndex;
 
 fn driver() -> TexDriver {
@@ -244,4 +244,32 @@ fn an_engine_stuck_in_a_loop_is_replaced_after_the_next_edit() {
     let (fresh, _) = cold_xdv(&fixed);
     assert_complete_xdv(driver.xdv());
     assert!(driver.xdv() == fresh.as_slice());
+}
+
+#[test]
+fn the_first_edit_after_the_blank_template_resumes_from_the_preamble_snapshot() {
+    let mut driver = driver();
+    driver.set_root_snapshot(BODY_SNAPSHOT_OFFSET);
+    driver.set_document(latex("").source().as_bytes());
+    run_to_end(&mut driver);
+    assert_eq!(driver.stats().roots_spawned, 1);
+    assert!(driver.stats().forks >= 1, "the root forked at the preamble");
+
+    let text = latex("alpha $x squared$ beta\n").source().to_owned();
+    driver.set_document(text.as_bytes());
+    let first_edit = run_to_end(&mut driver);
+
+    assert_eq!(
+        driver.stats().roots_spawned,
+        1,
+        "the first edit did not restart"
+    );
+    let (cold, cold_time) = cold_xdv(&text);
+    assert_complete_xdv(driver.xdv());
+    assert!(
+        driver.xdv() == cold.as_slice(),
+        "resumed XDV equals a cold compile"
+    );
+    assert!(driver.messages().iter().all(|message| !message.error));
+    println!("first edit after launch: {first_edit:?}; cold compile: {cold_time:?}");
 }

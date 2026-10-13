@@ -304,3 +304,8 @@ const TEMPLATE_PREFIX: &str = r"\documentclass[a4paper,11pt]{article}
 
 const TEMPLATE_SUFFIX: &str = r"\end{document}
 ";
+
+/// Byte offset of the template's blank line just before the note's body. Every generated source
+/// is identical up to it, so an engine snapshot taken when it is read serves every edit of the
+/// note (see [`crate::driver::TexDriver::set_root_snapshot`]).
+pub const BODY_SNAPSHOT_OFFSET: usize = TEMPLATE_PREFIX.len() - 1;
