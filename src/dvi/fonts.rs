@@ -6,7 +6,8 @@
 //!   basename, drawn by glyph id.
 //!
 //! Outlines are cached once per (face, glyph) in em units, y up, so every size of a face shares
-//! them. A missing file, face or glyph is reported once on stderr and then skipped.
+//! them. A missing file, face or glyph is reported once through [`FontStore::take_warnings`] and
+//! then skipped.
 
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
@@ -32,15 +33,21 @@ pub trait FontFiles {
     fn read(&mut self, name: &str) -> Option<Arc<[u8]>>;
 }
 
-/// [`FontFiles`] served from the verified, cache-only Tectonic bundle.
+/// [`FontFiles`] served from a Tectonic bundle.
 pub struct BundleFontFiles {
     bundle: Box<dyn Bundle>,
 }
 
 impl BundleFontFiles {
+    /// Serve font files from `bundle`; an online bundle caches what it fetches.
+    pub fn new(bundle: Box<dyn Bundle>) -> Self {
+        Self { bundle }
+    }
+
+    /// Serve font files from the verified cache, without touching the network.
     pub fn open(cache_dir: &Path) -> Result<Self, String> {
         open_bundle(cache_dir, true)
-            .map(|bundle| Self { bundle })
+            .map(Self::new)
             .map_err(|error| error.to_string())
     }
 }
@@ -93,6 +100,8 @@ pub struct FontStore {
     loaded: Vec<Face>,
     outlines: HashMap<(usize, u32), Option<Arc<BezPath>>>,
     warned: HashSet<String>,
+    /// Warnings not yet collected by [`FontStore::take_warnings`].
+    warnings: Vec<String>,
 }
 
 impl FontStore {
@@ -105,21 +114,24 @@ impl FontStore {
             loaded: Vec::new(),
             outlines: HashMap::new(),
             warned: HashSet::new(),
+            warnings: Vec::new(),
         }
     }
 
-    /// Load the metrics, outline files and encodings of the TFM fonts `tfm_names`, and the
-    /// native font files `native_names` (face 0), before a page first uses them, so that page
-    /// renders without the loading delay. A font that cannot be loaded is reported once, as on
-    /// first use.
-    pub fn preload(&mut self, tfm_names: &[&str], native_names: &[&str]) {
+    /// Load the metrics, outline files and encodings of the TFM fonts `tfm_names` before a page
+    /// first uses them, so that page renders without the loading delay. A font that cannot be
+    /// loaded is reported once, as on first use.
+    pub fn preload(&mut self, tfm_names: &[&str]) {
         for name in tfm_names {
             self.tfm(name);
             self.face_by_key(FaceKey::Tfm((*name).to_owned()));
         }
-        for name in native_names {
-            self.face_by_key(FaceKey::Native((*name).to_owned(), 0));
-        }
+    }
+
+    /// Problems found since the last call (each reported once per store), for the caller to
+    /// surface.
+    pub fn take_warnings(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.warnings)
     }
 
     /// Advance of `code` in DVI units; 0 for native fonts and missing metrics.
@@ -275,7 +287,7 @@ impl FontStore {
 
     fn warn(&mut self, message: String) {
         if self.warned.insert(message.clone()) {
-            eprintln!("mathnote: {message}");
+            self.warnings.push(message);
         }
     }
 }

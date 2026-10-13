@@ -2,7 +2,7 @@
 //!
 //! - the engine sends *queries*: `tag u32` + `time u32` + fields, all little-endian, with
 //!   four-character tags; strings are `u32 len` + bytes;
-//! - the driver replies with *answers* (`DONE`, `PASS`, `SIZE`, `MTIM`, `READ`, `FORK`, `OPEN`)
+//! - the driver replies with *answers* (`DONE`, `PASS`, `SIZE`, `READ`, `FORK`, `OPEN`)
 //!   and may interleave the *ask* `FLSH`, which the engine consumes while waiting for an answer;
 //! - `CHLD` carries a child pid plus the child's socket end through `SCM_RIGHTS`.
 //!
@@ -30,14 +30,12 @@ pub const Q_READ: u32 = pack(*b"READ");
 pub const Q_APND: u32 = pack(*b"APND");
 pub const Q_CLOS: u32 = pack(*b"CLOS");
 pub const Q_SIZE: u32 = pack(*b"SIZE");
-pub const Q_MTIM: u32 = pack(*b"MTIM");
 pub const Q_SEEN: u32 = pack(*b"SEEN");
 pub const Q_CHLD: u32 = pack(*b"CHLD");
 
 pub const A_DONE: u32 = pack(*b"DONE");
 pub const A_PASS: u32 = pack(*b"PASS");
 pub const A_SIZE: u32 = pack(*b"SIZE");
-pub const A_MTIM: u32 = pack(*b"MTIM");
 pub const A_READ: u32 = pack(*b"READ");
 pub const A_FORK: u32 = pack(*b"FORK");
 pub const A_OPEN: u32 = pack(*b"OPEN");
@@ -63,7 +61,6 @@ pub enum QueryBody {
     Append { fid: i32, data: Vec<u8> },
     Close { fid: i32 },
     Size { fid: i32 },
-    Mtime { fid: i32 },
     Seen { fid: i32, pos: u32 },
     Child { pid: i32, fd: OwnedFd },
 }
@@ -79,7 +76,6 @@ pub enum Answer {
     Done,
     Pass,
     Size(u32),
-    Mtime(u32),
     Read(Vec<u8>),
     Fork,
     Open(String),
@@ -93,10 +89,6 @@ impl Answer {
             Answer::Size(size) => {
                 put_u32(out, A_SIZE);
                 put_u32(out, *size);
-            }
-            Answer::Mtime(mtime) => {
-                put_u32(out, A_MTIM);
-                put_u32(out, *mtime);
             }
             Answer::Read(data) => {
                 put_u32(out, A_READ);
@@ -424,9 +416,6 @@ impl DriverChannel {
                 fid: self.take_i32()?,
             },
             Q_SIZE => QueryBody::Size {
-                fid: self.take_i32()?,
-            },
-            Q_MTIM => QueryBody::Mtime {
                 fid: self.take_i32()?,
             },
             Q_SEEN => QueryBody::Seen {

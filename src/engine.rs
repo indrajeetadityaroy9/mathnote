@@ -36,9 +36,9 @@ use tectonic_bundles::Bundle;
 
 use crate::cache;
 use crate::protocol::{
-    A_DONE, A_FORK, A_MTIM, A_OPEN, A_PASS, A_READ, A_SIZE, C_FLSH, CLIENT_HANDSHAKE,
-    ENGINE_CHANNEL_FD, EngineChannel, Q_APND, Q_CLOS, Q_MTIM, Q_OPRD, Q_OPWR, Q_READ, Q_SEEN,
-    Q_SIZE, SERVER_HANDSHAKE, STDOUT_FID, read_exact_fd, send_child,
+    A_DONE, A_FORK, A_OPEN, A_PASS, A_READ, A_SIZE, C_FLSH, CLIENT_HANDSHAKE, ENGINE_CHANNEL_FD,
+    EngineChannel, Q_APND, Q_CLOS, Q_OPRD, Q_OPWR, Q_READ, Q_SEEN, Q_SIZE, SERVER_HANDSHAKE,
+    STDOUT_FID, read_exact_fd, send_child,
 };
 
 /// Name under which the driver serves the primary document.
@@ -278,16 +278,6 @@ impl Client {
         self.send_tag(Q_SIZE);
         self.chan.send_i32(fid);
         if self.recv_tag() != A_SIZE {
-            driver_gone();
-        }
-        self.recv_u32()
-    }
-
-    #[allow(dead_code)]
-    fn mtime(&mut self, fid: i32) -> u32 {
-        self.send_tag(Q_MTIM);
-        self.chan.send_i32(fid);
-        if self.recv_tag() != A_MTIM {
             driver_gone();
         }
         self.recv_u32()

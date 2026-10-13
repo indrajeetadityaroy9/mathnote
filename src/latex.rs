@@ -309,3 +309,10 @@ const TEMPLATE_SUFFIX: &str = r"\end{document}
 /// is identical up to it, so an engine snapshot taken when it is read serves every edit of the
 /// note (see [`crate::driver::TexDriver::set_root_snapshot`]).
 pub const BODY_SNAPSHOT_OFFSET: usize = TEMPLATE_PREFIX.len() - 1;
+
+/// The classic TeX math fonts the template's mathematics can use: Computer Modern roman, math
+/// italic and symbols at the 11 pt article's text, script and script-script sizes (10.95, 8 and
+/// 6 pt), and the extension font, which LaTeX uses at every size.
+pub const TEMPLATE_MATH_FONTS: &[&str] = &[
+    "cmr10", "cmmi10", "cmsy10", "cmex10", "cmr8", "cmmi8", "cmsy8", "cmr6", "cmmi6", "cmsy6",
+];

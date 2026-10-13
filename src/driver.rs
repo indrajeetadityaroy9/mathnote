@@ -812,10 +812,6 @@ impl TexDriver {
                 let entry = self.cell(fid)?;
                 Answer::Size(self.entry_data(entry).len() as u32)
             }
-            QueryBody::Mtime { fid } => {
-                self.cell(fid)?;
-                Answer::Mtime(0)
-            }
             QueryBody::Seen { fid, pos } => {
                 let entry = self.cell(fid)?;
                 if i64::from(pos) > self.entries[entry].seen {

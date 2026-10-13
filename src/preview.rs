@@ -13,14 +13,11 @@ use crate::app::LoopEvent;
 use crate::cache::{cache_is_warmed, default_cache_dir, ensure_cache_warm};
 use crate::driver::{DriverConfig, EngineState, TexDriver, TexMessage};
 use crate::dvi::{BundleFontFiles, FontStore, XdvDocument, render_page};
-use crate::latex::BODY_SNAPSHOT_OFFSET;
+use crate::latex::{BODY_SNAPSHOT_OFFSET, TEMPLATE_MATH_FONTS};
 use crate::synctex::SyncIndex;
 
 /// How long one engine step may serve queries before new commands are looked at.
 const ENGINE_STEP: Duration = Duration::from_millis(8);
-
-/// TFM fonts of the template's mathematics at text and script size (11 pt article).
-const PRELOADED_MATH_FONTS: &[&str] = &["cmr10", "cmmi10", "cmsy10", "cmex10", "cmr8", "cmmi8"];
 
 pub(crate) enum PreviewCommand {
     /// The complete LaTeX source of a revision.
@@ -43,6 +40,9 @@ pub(crate) enum PreviewEvent {
         messages: Vec<TexMessage>,
         sync: Option<Arc<SyncIndex>>,
     },
+    /// Problems the page renderer hit (missing fonts or glyphs, unreadable output), each
+    /// reported once.
+    Warnings(Vec<String>),
 }
 
 /// One page rendered for the preview pane.
@@ -132,6 +132,9 @@ impl Pipeline<'_> {
                 // needs them (not before the first run, which would delay it).
                 if self.driver.state() == EngineState::Finished {
                     self.preload_fonts();
+                    if !self.forward_warnings() {
+                        return;
+                    }
                 }
                 match commands.recv() {
                     Ok(command) => Some(command),
@@ -148,7 +151,7 @@ impl Pipeline<'_> {
             if self.driver.state() == EngineState::Running && self.driver.step(ENGINE_STEP) {
                 self.update_pages();
             }
-            if !self.render_view() || !self.report_finish() {
+            if !self.render_view() || !self.report_finish() || !self.forward_warnings() {
                 return;
             }
         }
@@ -171,14 +174,25 @@ impl Pipeline<'_> {
         self.xdv.update(self.driver.xdv(), truncated);
     }
 
-    /// Load the classic math fonts the template uses at text and script size once, while the
-    /// engine is idle. The cache bootstrap typesets them, so their files are always cached; the
-    /// text font is loaded by the first page render.
+    /// Load the classic math fonts the template uses once, while the engine is idle. The cache
+    /// bootstrap fetches their files, so they are always cached; the text font is loaded by the
+    /// first page render.
     fn preload_fonts(&mut self) {
         if !self.fonts_preloaded {
             self.fonts_preloaded = true;
-            self.fonts.preload(PRELOADED_MATH_FONTS, &[]);
+            self.fonts.preload(TEMPLATE_MATH_FONTS);
         }
+    }
+
+    /// Send the renderer's new warnings to the editor; `false` once the editor is gone.
+    fn forward_warnings(&mut self) -> bool {
+        let mut warnings = self.xdv.take_warnings();
+        warnings.extend(self.fonts.take_warnings());
+        warnings.is_empty()
+            || self
+                .events
+                .send(LoopEvent::Preview(PreviewEvent::Warnings(warnings)))
+                .is_ok()
     }
 
     /// Render the viewed page when it or the view changed; `false` once the editor is gone.

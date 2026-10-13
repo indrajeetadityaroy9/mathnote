@@ -8,8 +8,9 @@
 //! Bundle integrity:
 //! One exact format-33 URL is used, and the bundle is rejected unless Tectonic reports the
 //! expected cryptographic content digest. The bootstrap typesets a canonical note to PDF, which
-//! fetches every file the template, the engine format and the page renderer need. Afterwards the
-//! verified cache is used offline.
+//! fetches every file the template and the engine format need, then loads every math font the
+//! template can use through the page renderer's own lookups, which fetches their metrics, map
+//! entries and outline files. Afterwards the verified cache is used offline.
 
 use std::{
     env,
@@ -28,13 +29,14 @@ use tectonic::{
 };
 use tectonic_bundles::{Bundle, detect_bundle};
 
-use crate::{document::Document, latex::emit_latex};
+use crate::dvi::{BundleFontFiles, FontStore};
+use crate::{document::Document, latex::TEMPLATE_MATH_FONTS, latex::emit_latex};
 
 const FORMAT_VERSION: u32 = 33;
 const BUNDLE_URL: &str = "https://data1b.fullyjustified.net/tlextras-2022.0r0.tar";
 const BUNDLE_DIGEST: &str = "6ffe055852f8faf66c0acbe1a7fb27f87b869a90bad1204f3bf4d9683f597c7c";
 const CACHE_READY_MARKER: &str = "bundle-v33.ready";
-const CACHE_SCHEMA_VERSION: u32 = 2;
+const CACHE_SCHEMA_VERSION: u32 = 3;
 const CACHE_WARMUP_NOTE: &str = concat!(
     "$α β γ δ ε ζ η θ ι κ λ μ ν ξ π ρ σ τ υ φ χ ψ ω$\n\n",
     "$Γ Δ Θ Λ Ξ Π Σ Υ Φ Ψ Ω ϵ ϑ ϖ ϱ$\n\n",
@@ -100,8 +102,8 @@ pub fn bundle_digest() -> DigestData {
         .expect("BUNDLE_DIGEST is a valid SHA-256 hex digest")
 }
 
-/// Typeset the canonical note online, fetching and verifying every resource it needs, then mark
-/// the cache ready.
+/// Typeset the canonical note online and load the template's math fonts, fetching and verifying
+/// every resource they need, then mark the cache ready.
 fn warm_cache(cache_dir: &Path) -> Result<(), CacheError> {
     let document = Document::parse(CACHE_WARMUP_NOTE).map_err(|error| CacheError::Bootstrap {
         message: format!("canonical cache warm-up note is invalid: {error}"),
@@ -129,6 +131,20 @@ fn warm_cache(cache_dir: &Path) -> Result<(), CacheError> {
         return Err(CacheError::Bootstrap {
             message: error.to_string(),
             details: status.messages,
+        });
+    }
+
+    // The PDF compile only fetches outline files for the font sizes the note uses; the renderer
+    // needs them for every size the template can produce (script-script digits use cmr6).
+    let mut fonts = FontStore::new(Box::new(BundleFontFiles::new(open_bundle(
+        cache_dir, false,
+    )?)));
+    fonts.preload(TEMPLATE_MATH_FONTS);
+    let missing = fonts.take_warnings();
+    if !missing.is_empty() {
+        return Err(CacheError::Bootstrap {
+            message: String::from("the bundle lacks files for the template's math fonts"),
+            details: missing,
         });
     }
 

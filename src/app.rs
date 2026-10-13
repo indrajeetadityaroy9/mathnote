@@ -29,6 +29,8 @@ use crate::worker::{BuildRequest, WorkerEvent, build_worker};
 
 const SPINNER_INTERVAL: Duration = Duration::from_millis(80);
 const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+/// Preview warnings kept for the help overlay; older ones are dropped first.
+const MAX_PREVIEW_WARNINGS: usize = 20;
 
 /// Everything that determines the terminal image of the preview pane. An unchanged key means
 /// nothing is re-encoded.
@@ -62,6 +64,8 @@ pub struct App {
     terminal_error: Option<io::Error>,
     status: PipelineStatus,
     diagnostic_span: Option<SourceSpan>,
+    /// Problems the page renderer reported, oldest first, shown in the help overlay.
+    preview_warnings: Vec<String>,
     spinner_frame: usize,
     last_spinner_tick: Instant,
     source_characters: usize,
@@ -216,6 +220,7 @@ impl App {
             terminal_error: None,
             status: PipelineStatus::Waiting,
             diagnostic_span: None,
+            preview_warnings: Vec::new(),
             spinner_frame: 0,
             last_spinner_tick: Instant::now(),
             source_characters: 0,
@@ -610,6 +615,18 @@ impl App {
             PreviewEvent::Preparing if !empty => self.status = PipelineStatus::Preparing,
             PreviewEvent::Preparing => {}
             PreviewEvent::Failed(message) => self.status = PipelineStatus::Error(message),
+            PreviewEvent::Warnings(warnings) => {
+                for warning in warnings {
+                    if !self.preview_warnings.contains(&warning) {
+                        self.preview_warnings.push(warning);
+                    }
+                }
+                let excess = self
+                    .preview_warnings
+                    .len()
+                    .saturating_sub(MAX_PREVIEW_WARNINGS);
+                self.preview_warnings.drain(..excess);
+            }
             PreviewEvent::Page(page) => {
                 self.page_count = page.pages;
                 if page.index == self.page_index {
@@ -1100,6 +1117,10 @@ impl App {
         self.show_help
     }
 
+    pub(crate) fn preview_warnings(&self) -> &[String] {
+        &self.preview_warnings
+    }
+
     pub(crate) fn latex_scroll(&self) -> u16 {
         self.latex_scroll_rows
     }
@@ -1120,13 +1141,22 @@ impl App {
                 format!("{spinner} preparing local LaTeX resources…")
             }
             PipelineStatus::Typesetting => format!("{spinner} typesetting…"),
-            PipelineStatus::Ready { elapsed, warnings } => match warnings {
-                0 => format!("ready in {} ms", elapsed.as_millis()),
-                warnings => format!(
-                    "ready in {} ms with {warnings} warning(s)",
-                    elapsed.as_millis()
-                ),
-            },
+            PipelineStatus::Ready { elapsed, warnings } => {
+                let mut status = match warnings {
+                    0 => format!("ready in {} ms", elapsed.as_millis()),
+                    warnings => format!(
+                        "ready in {} ms with {warnings} warning(s)",
+                        elapsed.as_millis()
+                    ),
+                };
+                if !self.preview_warnings.is_empty() {
+                    status.push_str(&format!(
+                        " · {} preview warning(s), see F1",
+                        self.preview_warnings.len()
+                    ));
+                }
+                status
+            }
             PipelineStatus::Error(message) => format!("error: {message}"),
         }
     }
@@ -1425,6 +1455,32 @@ mod tests {
         let crop = u32::from(app.preview_scroll_rows) * font_height;
         assert!(crop > 0);
         assert!(crop <= top && bottom <= crop + viewport);
+    }
+
+    #[test]
+    fn preview_warnings_are_kept_once_and_counted_in_the_status_line() {
+        let (mut app, _, _) = synced_app();
+        let missing = String::from("cmr6.pfb (for cmr6) is not available");
+        let warnings = || LoopEvent::Preview(PreviewEvent::Warnings(vec![missing.clone()]));
+        app.handle_loop_event(warnings());
+        app.handle_loop_event(warnings());
+
+        assert_eq!(app.preview_warnings(), std::slice::from_ref(&missing));
+        assert_eq!(
+            app.status_line(),
+            "ready in 12 ms · 1 preview warning(s), see F1"
+        );
+
+        for index in 0..MAX_PREVIEW_WARNINGS {
+            app.handle_loop_event(LoopEvent::Preview(PreviewEvent::Warnings(vec![format!(
+                "glyph {index} of font cmr10 is missing; skipping it"
+            )])));
+        }
+        assert_eq!(app.preview_warnings().len(), MAX_PREVIEW_WARNINGS);
+        assert!(
+            !app.preview_warnings().contains(&missing),
+            "the oldest warning is dropped first"
+        );
     }
 
     #[test]

@@ -373,6 +373,8 @@ pub struct XdvDocument {
     complete: bool,
     /// Set at an undecodable byte; parsing waits for a truncation before it.
     broken: bool,
+    /// Problems not yet collected by [`XdvDocument::take_warnings`].
+    warnings: Vec<String>,
 }
 
 impl XdvDocument {
@@ -402,6 +404,11 @@ impl XdvDocument {
     /// Whether the postamble has been reached.
     pub fn is_complete(&self) -> bool {
         self.complete
+    }
+
+    /// Problems found since the last call, for the caller to report.
+    pub fn take_warnings(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.warnings)
     }
 
     fn consumed(&self) -> usize {
@@ -561,7 +568,9 @@ impl XdvDocument {
     }
 
     fn fail(&mut self, at: usize) {
-        eprintln!("mathnote: undecodable XDV instruction at byte {at}; waiting for a rewrite");
+        self.warnings.push(format!(
+            "undecodable XDV instruction at byte {at}; waiting for a rewrite"
+        ));
         self.broken = true;
     }
 }

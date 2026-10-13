@@ -14,7 +14,7 @@ Priorities:
 | P4 | Feature gaps that only matter if the LaTeX template grows |
 
 Suggested order: P0.1–P0.3 in one commit (only `Cargo.toml` changes, already measured), then
-P2.1–P2.5, then P1.1–P1.3, then P3, then P4 as needed.
+P2.1–P2.5, then P1.1–P1.3, then P3, then P4 as needed. P0, P1 and P2 are done.
 
 ## Baseline
 
@@ -222,6 +222,26 @@ font-loading delay (time `render_view` with a temporary probe).
 
 ## P2 — correctness, documentation, hygiene
 
+**Status: done.**
+
+- **P2.1:** `README.md` describes the note syntax, the snapshot engine, the XDV renderer, terminal
+  output, SyncTeX, supported terminals, key bindings, build requirements and the resource cache.
+- **P2.2:** the reference-source clone was moved next to the repository (out of the working
+  tree), and the `.git/info/exclude` entry for it was removed.
+- **P2.3:** the `MTIM` query and answer are gone from the protocol, driver and engine; no
+  `#[allow(dead_code)]` remains in `src/`.
+- **P2.4:** `latex::TEMPLATE_MATH_FONTS` lists the ten classic math fonts the template can use
+  (cmr/cmmi/cmsy at 10, 8 and 6 pt, and cmex10). The warm-up loads all of them through the
+  renderer's own lookups with the bundle online, and fails if any is missing;
+  `CACHE_SCHEMA_VERSION` 3 makes existing caches refill (about 1 s online). An empty cache now
+  bootstraps with all ten `.pfb` files (42 MB, about 30 s). The page-renderer test includes
+  script-script material and fails on any renderer warning, and
+  `every_template_math_font_loads_from_the_offline_cache` failed against the old cache (cmsy8,
+  cmr6, cmmi6, cmsy6 missing) and passes after the refill.
+- **P2.5:** `FontStore` and `XdvDocument` collect warnings (`take_warnings`) instead of printing
+  them; the pipeline forwards them as `PreviewEvent::Warnings`, the status line adds
+  "N preview warning(s), see F1", and the F1 overlay lists them (at most 20, oldest dropped).
+
 ### P2.1 Rewrite the README
 
 **Why.** `README.md` still describes the old pipeline (compile to PDF with Tectonic, rasterize with
@@ -332,13 +352,14 @@ here.
 
 ### P3.2 Split `src/app.rs`
 
-**Why.** `src/app.rs` is 1,589 lines and mixes editor state with the preview pane.
+**Why.** `src/app.rs` is 1,624 lines and mixes editor state with the preview pane.
 
 **Change.** Move the preview-pane state and logic into its own module (for example
 `src/preview_pane.rs`): `PreviewViewport`, page index and count, scroll offset, sync target and
-highlight, `present_preview`, `install_visible_preview`, `scroll_preview`, `change_page`,
-`select_page`, `request_view`, `sync_from_preview_click`, and `fit_to_width`. `App` keeps the
-note buffer, LaTeX pane, focus, status line and event loop.
+highlight, preview warnings, `present_preview`, `install_visible_preview`, `scroll_preview`,
+`change_page`, `select_page`, `request_view` and `sync_from_preview_click` (`fit_to_width`
+already moved to `src/strips.rs` in P1.1). `App` keeps the note buffer, LaTeX pane, focus,
+status line and event loop.
 
 ### P3.3 Continuous integration
 

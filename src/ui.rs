@@ -39,7 +39,7 @@ pub(crate) fn render(frame: &mut Frame, app: &mut App) {
     render_status(frame, app, status_area, &theme);
 
     if app.show_help() {
-        render_help(frame, &theme);
+        render_help(frame, app.preview_warnings(), &theme);
     }
 }
 
@@ -272,14 +272,14 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     }
 }
 
-fn render_help(frame: &mut Frame, theme: &Theme) {
+fn render_help(frame: &mut Frame, preview_warnings: &[String], theme: &Theme) {
     let area = centered_rect(
         frame.area(),
         frame.area().width.saturating_mul(4) / 5,
         frame.area().height,
     );
     frame.render_widget(Clear, area);
-    let help = Text::from(vec![
+    let mut lines = vec![
         help_heading("GLOBAL", theme),
         help_binding("F1", "toggle command reference", theme),
         help_binding("F6 / Shift-F6", "cycle panes forward / backward", theme),
@@ -309,7 +309,17 @@ fn render_help(frame: &mut Frame, theme: &Theme) {
             theme,
         ),
         help_binding("Wheel", "scroll the pane under the pointer", theme),
-    ]);
+    ];
+    if !preview_warnings.is_empty() {
+        lines.push(help_heading("PREVIEW WARNINGS", theme));
+        lines.extend(preview_warnings.iter().map(|warning| {
+            Line::from(Span::styled(
+                format!("  {warning}"),
+                Style::default().fg(theme.warning),
+            ))
+        }));
+    }
+    let help = Text::from(lines);
     let block = panel_block(" ⌨ COMMAND REFERENCE  │  F1 / ESC CLOSE ", true, theme);
     frame.render_widget(
         Paragraph::new(help)
@@ -441,6 +451,29 @@ mod tests {
         assert!(screen.contains("F6 / Shift-F6"));
         assert!(screen.contains("jump from the preview"));
         assert!(screen.contains("MOUSE"));
+    }
+
+    #[test]
+    fn help_overlay_lists_preview_warnings() {
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let warnings = [String::from("cmr6.pfb (for cmr6) is not available")];
+        terminal
+            .draw(|frame| render_help(frame, &warnings, &Theme::default()))
+            .expect("render succeeds");
+
+        let buffer = terminal.backend().buffer();
+        let screen = (0..30)
+            .map(|y| {
+                (0..100)
+                    .filter_map(|x| buffer.cell((x, y)))
+                    .map(|cell| cell.symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(screen.contains("PREVIEW WARNINGS"));
+        assert!(screen.contains("cmr6.pfb (for cmr6) is not available"));
     }
 
     #[test]

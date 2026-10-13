@@ -3,6 +3,7 @@
 //! specials.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -10,10 +11,10 @@ use hayro::hayro_syntax::Pdf;
 use hayro::vello_cpu::color::palette::css::WHITE;
 use hayro::{RenderCache, RenderSettings, hayro_interpret::InterpreterSettings, render};
 use image::RgbaImage;
-use mathnote::cache::{default_cache_dir, open_bundle};
+use mathnote::cache::{default_cache_dir, ensure_cache_warm, open_bundle};
 use mathnote::document::Document;
 use mathnote::dvi::{BundleFontFiles, FontStore, XdvDocument, render_page};
-use mathnote::latex::emit_latex;
+use mathnote::latex::{TEMPLATE_MATH_FONTS, emit_latex};
 use tectonic::driver::{OutputFormat, ProcessingSessionBuilder};
 use tectonic::status::NoopStatusBackend;
 use tectonic_bundles::Bundle;
@@ -27,7 +28,6 @@ $a over b$ is a ratio.\n\n$$\nintegral of x\n$$\n";
 
 /// Display mathematics the note grammar has no words for (sums, subscripts, limits). It is
 /// inserted into the generated template as raw LaTeX, so the fonts and geometry stay mathnote's.
-/// Script sizes only: the cache holds no scriptscript (6 pt) Type1 files.
 const DISPLAY_MATH: &str = r"\[ \sum_{i=1}^{n} i^{2} = \frac{n(n+1)(2n+1)}{6} \]
 \[ \int_{0}^{1} x_{k}\,dx + \sqrt{a_{1} + b^{2}} \]
 ";
@@ -50,10 +50,13 @@ fn two_page_source() -> String {
 }
 
 /// Mathematics only: if TFM glyphs were missing, only fraction bars and root rules would remain.
+/// The last line nests scripts so every math size the template uses appears: script-script
+/// digits, letters and symbols (cmr6, cmmi6, cmsy6) and script symbols (cmsy8).
 fn math_only_source() -> String {
     let body = r"\[ \sum_{i=1}^{n} \frac{a_{i}}{b_{i}} = \int_{0}^{1} f(x)\,dx \]
 \[ \sqrt{x^{2} + y^{2}} \le \sum_{k=0}^{m} {m \choose k} \]
 \[ \frac{\partial u}{\partial t} = \alpha \nabla u + \beta_{0} \]
+\[ e^{x_{i}^{2}} + 2^{-n^{-1}} + y^{a^{3}} \]
 ";
     let latex = emit_latex(&Document::parse("").expect("empty note"));
     latex
@@ -61,8 +64,15 @@ fn math_only_source() -> String {
         .replace(r"\end{document}", &format!("{body}\\end{{document}}"))
 }
 
+/// The verified cache, bootstrapped (or refilled after a schema change) first if needed.
+fn warm_cache_dir() -> PathBuf {
+    let cache_dir = default_cache_dir();
+    ensure_cache_warm(&cache_dir).expect("warm Tectonic cache");
+    cache_dir
+}
+
 fn open_cached_bundle() -> Box<dyn Bundle> {
-    open_bundle(&default_cache_dir(), true).expect("verified cached bundle")
+    open_bundle(&warm_cache_dir(), true).expect("verified cached bundle")
 }
 
 /// The reference: Hayro's rendering of the PDF Tectonic makes from the same source, flattened
@@ -155,7 +165,7 @@ fn parse(data: &[u8]) -> XdvDocument {
 
 fn fonts() -> FontStore {
     FontStore::new(Box::new(
-        BundleFontFiles::open(&default_cache_dir()).expect("bundle opens"),
+        BundleFontFiles::open(&warm_cache_dir()).expect("bundle opens"),
     ))
 }
 
@@ -238,6 +248,11 @@ fn assert_page_zero_matches_pdf(label: &str, source: &str) {
     let mut fonts = fonts();
     let scale = WIDTH_PX as f32 / page.width;
     let ours = render_page(page, &mut fonts, scale);
+    let warnings = fonts.take_warnings();
+    assert!(
+        warnings.is_empty(),
+        "{label}: renderer warnings {warnings:?}"
+    );
     assert_eq!(ours.width(), WIDTH_PX, "{label}: width");
     assert!(
         ours.height().abs_diff(reference.height()) <= 1,
@@ -386,4 +401,11 @@ fn render_time_of_a_text_and_math_page() {
     }
     let warm = warm.elapsed() / runs;
     println!("page 0 at {WIDTH_PX} px: first render {cold:?}, then {warm:?} per render");
+}
+
+#[test]
+fn every_template_math_font_loads_from_the_offline_cache() {
+    let mut fonts = fonts();
+    fonts.preload(TEMPLATE_MATH_FONTS);
+    assert_eq!(fonts.take_warnings(), Vec::<String>::new());
 }
