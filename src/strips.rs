@@ -43,7 +43,7 @@ const PLACEHOLDER: char = '\u{10EEEE}';
 const DIACRITIC_ZERO: char = '\u{0305}';
 
 /// What the preview pane shows: part of a rendered page, with the sync highlight.
-pub(crate) struct Canvas {
+pub struct Canvas {
     pub page: Arc<RgbaImage>,
     /// First page pixel row shown.
     pub top: u32,
@@ -57,10 +57,29 @@ pub(crate) struct Canvas {
 }
 
 /// The strips of one install: every strip's pixels, and the encoded changed ones.
-pub(crate) struct EncodedStrips {
+pub struct EncodedStrips {
     generation: u64,
     pixels: Vec<Arc<RgbaImage>>,
     images: Vec<(usize, Result<StripImage, ImageError>)>,
+}
+
+impl EncodedStrips {
+    /// Number of strips that changed and were encoded.
+    pub fn changed_strips(&self) -> usize {
+        self.images.len()
+    }
+
+    /// Bytes of terminal graphics commands the changed strips will send, for Kitty-protocol
+    /// strips (other protocols encode inside ratatui-image and report 0).
+    pub fn kitty_bytes(&self) -> usize {
+        self.images
+            .iter()
+            .filter_map(|(_, image)| match image {
+                Ok(StripImage::Kitty(kitty)) => kitty.transmit.as_ref().map(String::len),
+                _ => None,
+            })
+            .sum()
+    }
 }
 
 struct EncodeJob {
@@ -165,7 +184,7 @@ struct Staged<K> {
     key: K,
 }
 
-pub(crate) struct StripPreview<K> {
+pub struct StripPreview<K> {
     encoder: mpsc::Sender<EncodeJob>,
     font: FontSize,
     generation: u64,
@@ -180,10 +199,7 @@ pub(crate) struct StripPreview<K> {
 impl<K: Copy + PartialEq> StripPreview<K> {
     /// Start the encoder thread. `deliver` hands each encoded install back to the UI loop and
     /// returns `false` once nobody listens any more.
-    pub(crate) fn new(
-        picker: Picker,
-        deliver: impl Fn(EncodedStrips) -> bool + Send + 'static,
-    ) -> Self {
+    pub fn new(picker: Picker, deliver: impl Fn(EncodedStrips) -> bool + Send + 'static) -> Self {
         let font = picker.font_size();
         let font_height = u32::from(font.height.max(1));
         let strip_height = match picker.protocol_type() {
@@ -279,7 +295,7 @@ impl<K: Copy + PartialEq> StripPreview<K> {
         !self.shown.is_empty()
     }
 
-    pub(crate) fn is_staging(&self) -> bool {
+    pub fn is_staging(&self) -> bool {
         self.staged.is_some()
     }
 
@@ -291,7 +307,7 @@ impl<K: Copy + PartialEq> StripPreview<K> {
 
     /// Show `canvas` under `key`. The strips are composed, compared with the shown ones and
     /// encoded on the background thread; the UI thread only queues the job.
-    pub(crate) fn install(&mut self, key: K, canvas: Canvas) {
+    pub fn install(&mut self, key: K, canvas: Canvas) {
         self.generation = self.generation.wrapping_add(1);
         // The shown set changes only by accepting the staged generation, so these are still the
         // strips on screen when this job's result is accepted.
@@ -314,7 +330,7 @@ impl<K: Copy + PartialEq> StripPreview<K> {
 
     /// Swap in the strips of the pending install once they are encoded; results of superseded
     /// installs are dropped. Returns whether the shown preview changed.
-    pub(crate) fn accept(&mut self, encoded: EncodedStrips) -> Result<bool, ImageError> {
+    pub fn accept(&mut self, encoded: EncodedStrips) -> Result<bool, ImageError> {
         let Some(staged) = self
             .staged
             .take_if(|staged| staged.generation == encoded.generation)

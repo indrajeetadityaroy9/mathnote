@@ -53,17 +53,18 @@ Nothing slow runs on the thread that handles keys and draws the screen:
 
 ## Build requirements
 
-Tectonic's XeTeX is linked in as a Rust library; no external TeX installation, PDF viewer or image tool is used at runtime. It links to native text libraries, so the build host and the resulting executable need compatible ICU, FreeType, Graphite2, and libpng libraries. The first-launch download uses the system libcurl: macOS always ships it, while Linux builds need the libcurl development package (for example `libcurl4-openssl-dev`). On macOS, the repository Cargo configuration discovers an existing Homebrew ICU installation from either the Apple Silicon or Intel prefix. The produced macOS binary is host-local rather than a standalone relocatable bundle, so rebuild it on a destination with matching native libraries.
+Tectonic's XeTeX engine is linked in as Rust crates; no external TeX installation, PDF viewer or image tool is used at runtime. It links to native text libraries, so the build host and the resulting executable need compatible ICU, FreeType, Graphite2, and libpng libraries, plus fontconfig on Linux. The first-launch download uses the system libcurl: macOS always ships it, while Linux builds need the libcurl and OpenSSL development packages. On macOS, install the libraries with Homebrew (`brew install icu4c freetype graphite2 libpng pkgconf`); on Ubuntu, `build-essential pkg-config libcurl4-openssl-dev libfontconfig1-dev libfreetype-dev libgraphite2-dev libicu-dev libpng-dev libssl-dev zlib1g-dev` is enough to build and pass the tests. On macOS, the repository Cargo configuration discovers an existing Homebrew ICU installation from either the Apple Silicon or Intel prefix. The produced macOS binary is host-local rather than a standalone relocatable bundle, so rebuild it on a destination with matching native libraries.
 
 ## Resource cache
 
-The first launch retrieves only the files required by mathnote's fixed TeX template from one pinned format-33 Tectonic bundle, including the outline files of every math font size the template can use. Mathnote rejects any bundle whose cryptographic content digest differs from the compiled-in expected digest, then caches the verified resources under the platform cache directory (`~/Library/Caches/mathnote` on macOS, `~/.cache/mathnote` on Linux). Later runs lock Tectonic to cache-only operation and work offline. If that verified cache becomes unusable, mathnote invalidates it and makes one online repair attempt.
+The first launch retrieves only the files required by mathnote's fixed TeX template from one pinned format-33 Tectonic bundle: it builds the LaTeX format, typesets a sample note with the editor's own engine and template, and renders it with the page renderer, fetching the outline files of every math font size the template can use. Mathnote rejects any bundle whose cryptographic content digest differs from the compiled-in expected digest, then caches the verified resources under the platform cache directory (`~/Library/Caches/mathnote` on macOS, `~/.cache/mathnote` on Linux). Later runs lock Tectonic to cache-only operation and work offline. If that verified cache becomes unusable, mathnote invalidates it and makes one online repair attempt.
 
 ## Development
 
 ```bash
 cargo test
 cargo clippy --all-targets
+cargo bench --bench latency
 ```
 
-The tests typeset real documents, so the first run needs network access to fill the resource cache. Planned work is tracked in [ROADMAP.md](ROADMAP.md).
+The tests typeset real documents, so the first run needs network access to fill the resource cache. The tests compare mathnote's page renderer with Tectonic's own PDF output, so they build Tectonic's full pipeline as a dev-dependency; the editor itself does not. The `latency` benchmark types a note one character at a time and reports typeset time per edit, page render time, preview update time, and the terminal bytes each edit sends. Planned work is tracked in [ROADMAP.md](ROADMAP.md).

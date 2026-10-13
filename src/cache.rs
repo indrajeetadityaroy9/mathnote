@@ -3,36 +3,48 @@
 //! Public API summary:
 //! - [`ensure_cache_warm`] makes the cache usable, bootstrapping it online when needed.
 //! - [`open_bundle`] opens the pinned bundle; with `only_cached` it never touches the network.
-//! - [`bundle_digest`] names the cached format files; [`default_cache_dir`] locates the cache.
+//! - [`FormatCache`] stores the compiled format; [`default_cache_dir`] locates the cache.
 //!
 //! Bundle integrity:
 //! One exact format-33 URL is used, and the bundle is rejected unless Tectonic reports the
-//! expected cryptographic content digest. The bootstrap typesets a canonical note to PDF, which
-//! fetches every file the template and the engine format need, then loads every math font the
-//! template can use through the page renderer's own lookups, which fetches their metrics, map
-//! entries and outline files. Afterwards the verified cache is used offline.
+//! expected cryptographic content digest. The bootstrap builds the LaTeX format if it is missing,
+//! typesets a canonical note with the same engine and template as the editor, and renders its
+//! pages and every math font the template can use through the page renderer's own lookups. All of
+//! that runs with the bundle online, so every file the engine, the template and the renderer need
+//! is fetched and verified once. Afterwards the verified cache is used offline.
 
 use std::{
+    cell::RefCell,
+    collections::HashMap,
     env,
     fmt::{self, Arguments, Display},
     fs,
+    io::{self, Cursor, ErrorKind, Write},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    rc::Rc,
+    sync::{
+        Mutex, PoisonError,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use directories::ProjectDirs;
-use tectonic::{
-    driver::{OutputFormat, ProcessingSessionBuilder},
-    io::DigestData,
-    status::{MessageKind, StatusBackend},
-};
+use tectonic_bridge_core::{CoreBridgeLauncher, DriverHooks};
 use tectonic_bundles::{Bundle, detect_bundle};
+use tectonic_engine_xetex::{FORMAT_SERIAL, TexEngine, TexOutcome};
+use tectonic_io_base::{InputHandle, InputOrigin, IoProvider, OpenResult, OutputHandle};
+use tectonic_status_base::{MessageKind, StatusBackend};
 
-use crate::dvi::{BundleFontFiles, FontStore};
+use crate::dvi::{BundleFontFiles, FontStore, XdvDocument, render_page};
+use crate::engine::PRIMARY_INPUT_NAME;
 use crate::{document::Document, latex::TEMPLATE_MATH_FONTS, latex::emit_latex};
 
 const FORMAT_VERSION: u32 = 33;
+// The pinned bundle's format files must match the linked engine.
+const _: () = assert!(FORMAT_VERSION == FORMAT_SERIAL);
+/// Name of the LaTeX format, as the engine requests it.
+const FORMAT_NAME: &str = "latex";
 const BUNDLE_URL: &str = "https://data1b.fullyjustified.net/tlextras-2022.0r0.tar";
 const BUNDLE_DIGEST: &str = "6ffe055852f8faf66c0acbe1a7fb27f87b869a90bad1204f3bf4d9683f597c7c";
 const CACHE_READY_MARKER: &str = "bundle-v33.ready";
@@ -85,7 +97,13 @@ pub fn cache_is_warmed() -> bool {
 
 /// Make the cache usable: bootstrap it when its ready marker is missing, and rebuild it once
 /// when the marked cache no longer opens.
+///
+/// One caller at a time per process: concurrent warm-ups race on fetching the same bundle
+/// files, and the bundle cache reports a file another fetch is still writing as unavailable.
+/// Later callers wait, then find the cache ready.
 pub fn ensure_cache_warm(cache_dir: &Path) -> Result<(), CacheError> {
+    static WARMING: Mutex<()> = Mutex::new(());
+    let _warming = WARMING.lock().unwrap_or_else(PoisonError::into_inner);
     if cache_marker_is_valid(cache_dir) {
         if open_bundle(cache_dir, true).is_ok() {
             return Ok(());
@@ -95,15 +113,69 @@ pub fn ensure_cache_warm(cache_dir: &Path) -> Result<(), CacheError> {
     warm_cache(cache_dir)
 }
 
-/// The pinned bundle digest, as used to name cached format files.
-pub fn bundle_digest() -> DigestData {
-    BUNDLE_DIGEST
-        .parse()
-        .expect("BUNDLE_DIGEST is a valid SHA-256 hex digest")
+/// Compiled format files, one per format name for the pinned bundle. File names follow
+/// Tectonic's own format cache (`<bundle digest>-<format>-<serial>.fmt`), so caches made before
+/// stay valid.
+pub struct FormatCache {
+    dir: PathBuf,
 }
 
-/// Typeset the canonical note online and load the template's math fonts, fetching and verifying
-/// every resource they need, then mark the cache ready.
+impl FormatCache {
+    pub fn new(cache_dir: &Path) -> Self {
+        Self {
+            dir: cache_dir.join("formats"),
+        }
+    }
+
+    /// Path of format `name`, ignoring any extensions (`latex.fmt` is `latex`).
+    fn path(&self, name: &str) -> PathBuf {
+        let stem = name.split('.').next().unwrap_or(name);
+        self.dir
+            .join(format!("{BUNDLE_DIGEST}-{stem}-{FORMAT_VERSION}.fmt"))
+    }
+}
+
+impl IoProvider for FormatCache {
+    fn input_open_format(
+        &mut self,
+        name: &str,
+        _status: &mut dyn StatusBackend,
+    ) -> OpenResult<InputHandle> {
+        match fs::read(self.path(name)) {
+            Ok(data) => OpenResult::Ok(InputHandle::new_read_only(
+                name,
+                Cursor::new(data),
+                InputOrigin::Other,
+            )),
+            Err(error) if error.kind() == ErrorKind::NotFound => OpenResult::NotAvailable,
+            Err(error) => OpenResult::Err(error.into()),
+        }
+    }
+
+    /// Written to a unique temporary file and renamed into place, since engine processes may
+    /// read the format concurrently.
+    fn write_format(
+        &mut self,
+        name: &str,
+        data: &[u8],
+        _status: &mut dyn StatusBackend,
+    ) -> tectonic_errors::Result<()> {
+        static STAGED: AtomicU64 = AtomicU64::new(0);
+        fs::create_dir_all(&self.dir)?;
+        let path = self.path(name);
+        let staged = path.with_extension(format!(
+            "fmt-{}-{}.tmp",
+            std::process::id(),
+            STAGED.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(&staged, data)?;
+        fs::rename(&staged, &path)?;
+        Ok(())
+    }
+}
+
+/// Build the format if it is missing, typeset the canonical note and render its pages, and load
+/// the template's math fonts, all with the bundle online, then mark the cache ready.
 fn warm_cache(cache_dir: &Path) -> Result<(), CacheError> {
     let document = Document::parse(CACHE_WARMUP_NOTE).map_err(|error| CacheError::Bootstrap {
         message: format!("canonical cache warm-up note is invalid: {error}"),
@@ -111,39 +183,67 @@ fn warm_cache(cache_dir: &Path) -> Result<(), CacheError> {
     })?;
     let latex = emit_latex(&document);
 
-    let bundle = open_bundle(cache_dir, false)?;
     let mut status = CapturingStatus::default();
-    let mut builder = ProcessingSessionBuilder::default();
-    builder
-        .bundle(bundle)
-        .primary_input_buffer(latex.source().as_bytes())
-        .tex_input_name("mathnote.tex")
-        .filesystem_root(cache_dir.join("sandbox"))
-        .format_name("latex")
-        .format_cache_path(cache_dir.join("formats"))
-        .print_stdout(false)
-        .output_format(OutputFormat::Pdf)
-        .do_not_write_output_files();
-    let result = builder
-        .create(&mut status)
-        .and_then(|mut session| session.run(&mut status));
-    if let Err(error) = result {
-        return Err(CacheError::Bootstrap {
-            message: error.to_string(),
-            details: status.messages,
-        });
+    if FormatCache::new(cache_dir)
+        .input_open_format(FORMAT_NAME, &mut status)
+        .is_not_available()
+    {
+        // Tectonic's format recipe: initex on `\input tectonic-format-<name>.tex`.
+        let primary = format!("\\input tectonic-format-{FORMAT_NAME}.tex");
+        let outputs = warmup_tex(
+            cache_dir,
+            primary.into_bytes(),
+            true,
+            "UNUSED.fmt",
+            "texput",
+        )?;
+        let format = outputs
+            .into_iter()
+            .find_map(|(name, data)| name.ends_with(".fmt").then_some(data))
+            .ok_or_else(|| CacheError::Bootstrap {
+                message: String::from("the format build wrote no format file"),
+                details: Vec::new(),
+            })?;
+        FormatCache::new(cache_dir)
+            .write_format(FORMAT_NAME, &format, &mut status)
+            .map_err(|error| CacheError::Directory {
+                path: cache_dir.join("formats"),
+                message: format!("{error:#}"),
+            })?;
     }
 
-    // The PDF compile only fetches outline files for the font sizes the note uses; the renderer
-    // needs them for every size the template can produce (script-script digits use cmr6).
+    let outputs = warmup_tex(
+        cache_dir,
+        latex.source().as_bytes().to_vec(),
+        false,
+        FORMAT_NAME,
+        PRIMARY_INPUT_NAME,
+    )?;
+    let xdv = outputs
+        .get("mathnote.xdv")
+        .ok_or_else(|| CacheError::Bootstrap {
+            message: String::from("the warm-up note produced no XDV output"),
+            details: Vec::new(),
+        })?;
+
+    // Render through the page renderer's own lookups, then load the math fonts at every size
+    // the template can produce (script-script digits use cmr6), so their files are cached too.
     let mut fonts = FontStore::new(Box::new(BundleFontFiles::new(open_bundle(
         cache_dir, false,
     )?)));
+    let mut pages = XdvDocument::new();
+    pages.update(xdv, None);
+    for index in 0..pages.page_count() {
+        if let Some(page) = pages.page(index) {
+            render_page(page, &mut fonts, 0.25);
+        }
+    }
     fonts.preload(TEMPLATE_MATH_FONTS);
-    let missing = fonts.take_warnings();
-    if !missing.is_empty() {
+    let mut missing = pages.take_warnings();
+    missing.extend(fonts.take_warnings());
+    if pages.page_count() == 0 || !missing.is_empty() {
         return Err(CacheError::Bootstrap {
-            message: String::from("the bundle lacks files for the template's math fonts"),
+            message: String::from("the bundle lacks files the page renderer needs"),
             details: missing,
         });
     }
@@ -155,13 +255,152 @@ fn warm_cache(cache_dir: &Path) -> Result<(), CacheError> {
     })
 }
 
+/// Run XeTeX (in initex mode to build a format) in this process on `primary` with the bundle
+/// online; returns every file it wrote. Its terminal output is discarded.
+fn warmup_tex(
+    cache_dir: &Path,
+    primary: Vec<u8>,
+    initex: bool,
+    format_name: &str,
+    input_name: &str,
+) -> Result<HashMap<String, Vec<u8>>, CacheError> {
+    let outputs = Rc::new(RefCell::new(HashMap::new()));
+    let mut hooks = WarmupHooks {
+        io: WarmupIo {
+            primary,
+            outputs: Rc::clone(&outputs),
+            formats: FormatCache::new(cache_dir),
+            bundle: open_bundle(cache_dir, false)?,
+        },
+    };
+    let mut status = CapturingStatus::default();
+    let outcome = {
+        let mut launcher = CoreBridgeLauncher::new(&mut hooks, &mut status);
+        TexEngine::default()
+            .initex_mode(initex)
+            .halt_on_error_mode(true)
+            .process(&mut launcher, format_name, input_name)
+    };
+    match outcome {
+        Ok(TexOutcome::Spotless | TexOutcome::Warnings) => {}
+        Ok(TexOutcome::Errors) => {
+            return Err(CacheError::Bootstrap {
+                message: String::from("the TeX engine reported errors"),
+                details: status.messages,
+            });
+        }
+        Err(error) => {
+            return Err(CacheError::Bootstrap {
+                message: format!("{error:#}"),
+                details: status.messages,
+            });
+        }
+    }
+    drop(hooks);
+    Ok(Rc::try_unwrap(outputs)
+        .map(RefCell::into_inner)
+        .unwrap_or_default())
+}
+
+type Outputs = Rc<RefCell<HashMap<String, Vec<u8>>>>;
+
+/// The warm-up runs' files: the primary input and outputs in memory (outputs can be read back,
+/// as LaTeX re-reads its `.aux`), formats from the cache, everything else from the bundle.
+struct WarmupIo {
+    primary: Vec<u8>,
+    outputs: Outputs,
+    formats: FormatCache,
+    bundle: Box<dyn Bundle>,
+}
+
+impl IoProvider for WarmupIo {
+    fn output_open_name(&mut self, name: &str) -> OpenResult<OutputHandle> {
+        OpenResult::Ok(OutputHandle::new(
+            name,
+            MemoryOutput {
+                name: name.to_owned(),
+                data: Vec::new(),
+                outputs: Rc::clone(&self.outputs),
+            },
+        ))
+    }
+
+    fn output_open_stdout(&mut self) -> OpenResult<OutputHandle> {
+        OpenResult::Ok(OutputHandle::new("stdout", io::sink()))
+    }
+
+    fn input_open_name(
+        &mut self,
+        name: &str,
+        status: &mut dyn StatusBackend,
+    ) -> OpenResult<InputHandle> {
+        if let Some(data) = self.outputs.borrow().get(name) {
+            return OpenResult::Ok(InputHandle::new(
+                name,
+                Cursor::new(data.clone()),
+                InputOrigin::Other,
+            ));
+        }
+        self.bundle.input_open_name(name, status)
+    }
+
+    fn input_open_primary(&mut self, _status: &mut dyn StatusBackend) -> OpenResult<InputHandle> {
+        OpenResult::Ok(InputHandle::new(
+            PRIMARY_INPUT_NAME,
+            Cursor::new(self.primary.clone()),
+            InputOrigin::Other,
+        ))
+    }
+
+    fn input_open_format(
+        &mut self,
+        name: &str,
+        status: &mut dyn StatusBackend,
+    ) -> OpenResult<InputHandle> {
+        self.formats.input_open_format(name, status)
+    }
+}
+
+/// An output file kept in memory; stored in [`WarmupIo::outputs`] when the engine closes it.
+struct MemoryOutput {
+    name: String,
+    data: Vec<u8>,
+    outputs: Outputs,
+}
+
+impl Write for MemoryOutput {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.data.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for MemoryOutput {
+    fn drop(&mut self) {
+        self.outputs.borrow_mut().insert(
+            std::mem::take(&mut self.name),
+            std::mem::take(&mut self.data),
+        );
+    }
+}
+
+struct WarmupHooks {
+    io: WarmupIo,
+}
+
+impl DriverHooks for WarmupHooks {
+    fn io(&mut self) -> &mut dyn IoProvider {
+        &mut self.io
+    }
+}
+
 /// Open the pinned bundle and verify its digest. `only_cached` locks it to the local cache.
 pub fn open_bundle(cache_dir: &Path, only_cached: bool) -> Result<Box<dyn Bundle>, CacheError> {
-    for path in [
-        cache_dir.to_path_buf(),
-        cache_dir.join("formats"),
-        cache_dir.join("sandbox"),
-    ] {
+    for path in [cache_dir.to_path_buf(), cache_dir.join("formats")] {
         fs::create_dir_all(&path).map_err(|error| CacheError::Directory {
             path: path.clone(),
             message: error.to_string(),
@@ -280,7 +519,12 @@ struct CapturingStatus {
 }
 
 impl StatusBackend for CapturingStatus {
-    fn report(&mut self, kind: MessageKind, args: Arguments<'_>, err: Option<&tectonic::Error>) {
+    fn report(
+        &mut self,
+        kind: MessageKind,
+        args: Arguments<'_>,
+        err: Option<&tectonic_errors::Error>,
+    ) {
         if kind == MessageKind::Note {
             return;
         }

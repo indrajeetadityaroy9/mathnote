@@ -2240,6 +2240,10 @@ dependencies = [
  "tectonic",
  "tectonic_bridge_core",
  "tectonic_bundles",
+ "tectonic_engine_xetex",
+ "tectonic_errors",
+ "tectonic_io_base",
+ "tectonic_status_base",
  "unicode-width 0.2.2",
  "vello_cpu",
 ]

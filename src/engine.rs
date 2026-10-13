@@ -26,15 +26,15 @@ use nix::libc;
 use nix::sys::socket::{AddressFamily, SockFlag, SockType, socketpair};
 use nix::sys::wait::waitpid;
 use nix::unistd::{ForkResult, Pid, fork};
-use tectonic::TexEngine;
-use tectonic::TexOutcome;
-use tectonic::io::format_cache::FormatCache;
-use tectonic::io::{InputFeatures, InputHandle, InputOrigin, IoProvider, OpenResult, OutputHandle};
-use tectonic::status::{MessageKind, StatusBackend};
 use tectonic_bridge_core::{CoreBridgeLauncher, DriverHooks};
 use tectonic_bundles::Bundle;
+use tectonic_engine_xetex::{TexEngine, TexOutcome};
+use tectonic_io_base::{
+    InputFeatures, InputHandle, InputOrigin, IoProvider, OpenResult, OutputHandle,
+};
+use tectonic_status_base::{MessageKind, StatusBackend};
 
-use crate::cache;
+use crate::cache::{self, FormatCache};
 use crate::protocol::{
     A_DONE, A_FORK, A_OPEN, A_PASS, A_READ, A_SIZE, C_FLSH, CLIENT_HANDSHAKE, ENGINE_CHANNEL_FD,
     EngineChannel, Q_APND, Q_CLOS, Q_OPRD, Q_OPWR, Q_READ, Q_SEEN, Q_SIZE, SERVER_HANDSHAKE,
@@ -410,14 +410,14 @@ impl Read for DriverInput {
 }
 
 impl InputFeatures for DriverInput {
-    fn get_size(&mut self) -> tectonic::Result<usize> {
+    fn get_size(&mut self) -> tectonic_errors::Result<usize> {
         if self.file_size.is_none() {
             self.file_size = Some(self.client.borrow_mut().size(self.id));
         }
         Ok(self.file_size.unwrap_or(0) as usize)
     }
 
-    fn try_seek(&mut self, pos: SeekFrom) -> tectonic::Result<u64> {
+    fn try_seek(&mut self, pos: SeekFrom) -> tectonic_errors::Result<u64> {
         match pos {
             SeekFrom::Start(0) => {
                 // `ttstub_input_seek` with ofs 0: buf_pos would be -file_pos, never > 0.
@@ -431,7 +431,7 @@ impl InputFeatures for DriverInput {
         }
     }
 
-    fn get_unix_mtime(&mut self) -> tectonic::Result<Option<i64>> {
+    fn get_unix_mtime(&mut self) -> tectonic_errors::Result<Option<i64>> {
         Ok(None)
     }
 }
@@ -536,10 +536,7 @@ impl IoProvider for EngineIo {
         name: &str,
         status: &mut dyn StatusBackend,
     ) -> OpenResult<InputHandle> {
-        match self.formats.input_open_format(name, status) {
-            OpenResult::Ok(handle) => read_fully(handle),
-            other => other,
-        }
+        self.formats.input_open_format(name, status)
     }
 }
 
@@ -605,7 +602,12 @@ impl EngineStatus {
 }
 
 impl StatusBackend for EngineStatus {
-    fn report(&mut self, kind: MessageKind, args: Arguments<'_>, err: Option<&tectonic::Error>) {
+    fn report(
+        &mut self,
+        kind: MessageKind,
+        args: Arguments<'_>,
+        err: Option<&tectonic_errors::Error>,
+    ) {
         let kind = match kind {
             MessageKind::Note => "note",
             MessageKind::Warning => "warning",
@@ -630,7 +632,7 @@ fn run_tex(
     cache_dir: &Path,
 ) -> Result<TexOutcome, String> {
     let bundle = cache::open_bundle(cache_dir, true).map_err(|error| error.to_string())?;
-    let formats = FormatCache::new(cache::bundle_digest(), cache_dir.join("formats"));
+    let formats = FormatCache::new(cache_dir);
     let mut hooks = EngineHooks {
         io: EngineIo {
             client: Rc::clone(client),

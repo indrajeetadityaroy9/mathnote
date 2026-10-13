@@ -19,9 +19,9 @@ use skrifa::instance::{LocationRef, Size};
 use skrifa::outline::{DrawSettings, OutlinePen};
 use skrifa::raw::ps::type1::Type1Font;
 use skrifa::{FontRef, GlyphId, MetadataProvider};
-use tectonic::io::{IoProvider, OpenResult};
-use tectonic::status::NoopStatusBackend;
 use tectonic_bundles::Bundle;
+use tectonic_io_base::{IoProvider, OpenResult};
+use tectonic_status_base::NoopStatusBackend;
 
 use super::fontmap::{FontMap, parse_encoding};
 use super::tfm::Tfm;

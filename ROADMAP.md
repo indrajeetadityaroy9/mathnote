@@ -14,7 +14,7 @@ Priorities:
 | P4 | Feature gaps that only matter if the LaTeX template grows |
 
 Suggested order: P0.1–P0.3 in one commit (only `Cargo.toml` changes, already measured), then
-P2.1–P2.5, then P1.1–P1.3, then P3, then P4 as needed. P0, P1 and P2 are done.
+P2.1–P2.5, then P1.1–P1.3, then P3, then P4 as needed. P0 to P3 are done.
 
 ## Baseline
 
@@ -313,6 +313,38 @@ help overlay instead of writing to stderr.
 
 ## P3 — deeper build cleanup and structure
 
+**Status: done.** Clean release build in a fresh target directory, nothing else running:
+
+| | After P0 | After P3 |
+|---|---|---|
+| Build time (wall clock) | 60 s | 44 s |
+| Build CPU time | 412 s | 238 s |
+| Binary size | 11.4 MB | 5.6 MB |
+| Packages in the normal dependency graph | 376 | 234 |
+
+- **P3.1:** mathnote depends on `tectonic_engine_xetex`, `tectonic_io_base`,
+  `tectonic_status_base` and `tectonic_errors` directly; `tectonic` is a dev-dependency only, for
+  the reference PDFs in `tests/dvi_render.rs`. watchexec, tera, clap, the gix family, tokio and
+  the xdvipdfmx, bibtex and HTML engines are gone from the editor's build (`tectonic_pdf_io`
+  stays: XeTeX itself links it). `cache::FormatCache` replaces Tectonic's format cache with the same
+  file names, so existing caches stay valid. The warm-up runs XeTeX in-process with the bundle
+  online: initex on `tectonic-format-latex.tex` when the format is missing, then the canonical
+  note with the editor's engine settings, then renders its pages and preloads
+  `TEMPLATE_MATH_FONTS` through the page renderer. Warm-ups are serialized per process: concurrent
+  test threads warming an empty cache made the bundle cache report files another fetch was still
+  writing as unavailable. Verified from an empty cache on macOS (tests, and a real first launch
+  that reached "ready" after about 30 s with no TeX output on the screen) and on Linux, built and
+  tested for the first time in an Ubuntu 24.04 container (aarch64) with no source changes; it
+  needs `libssl-dev`, which the libcurl bindings pull in on Linux.
+- **P3.2:** `src/preview_pane.rs` holds the preview pane (`PreviewPane`: page, scroll, sync
+  highlight, warnings, strips); `App` passes it the sync target and documents and sends its view
+  requests. `src/app.rs` went from 1,624 to 1,334 lines.
+- **P3.3:** `cargo bench --bench latency` (`benches/latency.rs`) types a note one character at a
+  time and reports, on this machine: typeset per edit median 2.8 ms (p90 3.7 ms, 1 engine root
+  for 86 edits); page render at 1280 px 34 ms first, then median 1.3–1.5 ms; UI-thread preview
+  install about 0.001 ms; strips encoded 1.2–1.5 ms after install; 1 changed strip per edit
+  (max 2), about 4.6 KB of Kitty output per edit. `mathnote::strips` is public for it.
+
 ### P3.1 Replace the `tectonic` umbrella crate with its component crates
 
 **Why.** After P0.1–P0.2, crates reachable only through the `tectonic` umbrella still account for
@@ -361,20 +393,7 @@ highlight, preview warnings, `present_preview`, `install_visible_preview`, `scro
 already moved to `src/strips.rs` in P1.1). `App` keeps the note buffer, LaTeX pane, focus,
 status line and event loop.
 
-### P3.3 Continuous integration
-
-**Why.**
-
-- Tests assume a warm resource cache in the user's cache directory (first run needs network).
-- Linux has never been built or run: forking, `OBJC_DISABLE_INITIALIZE_FORK_SAFETY` (set in
-  `TexDriver::spawn_root`, only meaningful on macOS), libcurl if P0.2 is adopted, and the terminal
-  graphics paths.
-
-**Change.** A GitHub Actions workflow on macOS and Linux: install ICU/FreeType/Graphite2/libpng
-(and libcurl), cache `~/.cargo` and the Tectonic resource cache keyed by the bundle digest, then
-run `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test`.
-
-### P3.4 Permanent latency and bandwidth benchmark
+### P3.3 Permanent latency and bandwidth benchmark
 
 **Why.** The baseline numbers above came from throwaway probes and a pseudo-terminal harness that
 were deleted after use. Nothing catches a regression.

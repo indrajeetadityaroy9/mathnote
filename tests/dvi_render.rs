@@ -120,13 +120,16 @@ fn hayro_page(pdf: Vec<u8>, index: usize, width: u32) -> (usize, RgbaImage) {
 fn run(source: &str, format: OutputFormat) -> HashMap<String, Vec<u8>> {
     let cache = default_cache_dir();
     let bundle = open_cached_bundle();
+    // An empty directory: the reference compile reads nothing from the filesystem.
+    let root = std::env::temp_dir().join("mathnote-dvi-render");
+    std::fs::create_dir_all(&root).expect("reference filesystem root");
     let mut status = NoopStatusBackend::default();
     let mut builder = ProcessingSessionBuilder::default();
     builder
         .bundle(bundle)
         .primary_input_buffer(source.as_bytes())
         .tex_input_name("doc.tex")
-        .filesystem_root(cache.join("sandbox"))
+        .filesystem_root(root)
         .format_name("latex")
         .format_cache_path(cache.join("formats"))
         .keep_intermediates(true)

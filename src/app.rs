@@ -20,32 +20,15 @@ use ratatui_image::picker::Picker;
 
 use crate::document::{Document, SourceSpan, TextBuffer, map_offset_across_edit};
 use crate::latex::{LatexDocument, emit_latex};
-use crate::preview::{PreviewCommand, PreviewEvent, RenderedPage, preview_thread};
-use crate::strips::{Canvas, EncodedStrips, StripPreview};
-use crate::synctex::{SyncIndex, SyncTarget};
-use crate::theme::Theme;
+use crate::preview::{PreviewCommand, PreviewEvent, preview_thread};
+use crate::preview_pane::PreviewPane;
+use crate::strips::EncodedStrips;
+use crate::synctex::SyncIndex;
 use crate::ui;
 use crate::worker::{BuildRequest, WorkerEvent, build_worker};
 
 const SPINNER_INTERVAL: Duration = Duration::from_millis(80);
 const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-/// Preview warnings kept for the help overlay; older ones are dropped first.
-const MAX_PREVIEW_WARNINGS: usize = 20;
-
-/// Everything that determines the terminal image of the preview pane. An unchanged key means
-/// nothing is re-encoded.
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct PreviewViewport {
-    fingerprint: u64,
-    page_index: usize,
-    image_width: u32,
-    pane_width: u16,
-    pane_height: u16,
-    crop_y: u32,
-    /// Pixels per big point of the page image.
-    scale: f32,
-    highlight: Option<(u32, u32)>,
-}
 
 /// The editor: the note, its generated LaTeX, and the live preview of the typeset page. The
 /// typesetting pipeline (the snapshot driver) runs on a background thread.
@@ -64,8 +47,6 @@ pub struct App {
     terminal_error: Option<io::Error>,
     status: PipelineStatus,
     diagnostic_span: Option<SourceSpan>,
-    /// Problems the page renderer reported, oldest first, shown in the help overlay.
-    preview_warnings: Vec<String>,
     spinner_frame: usize,
     last_spinner_tick: Instant,
     source_characters: usize,
@@ -77,17 +58,7 @@ pub struct App {
     /// The newest revision the pipeline finished; `sync` belongs to it.
     typeset_revision: Option<u64>,
     sync: Option<Arc<SyncIndex>>,
-    page_count: usize,
-    page_index: usize,
-    /// The rendered image of `page_index`, when it has arrived.
-    page: Option<RenderedPage>,
-    requested_view: Option<(usize, u32)>,
-    picker: Picker,
-    strips: StripPreview<PreviewViewport>,
-    /// Typeset extent of the cursor's note line.
-    sync_target: Option<SyncTarget>,
-    /// `sync_target` in page image pixel rows `[top, bottom)`.
-    highlight: Option<(u32, u32)>,
+    preview: PreviewPane,
     /// Terminal cell of the editing caret for the frame being drawn.
     caret: Option<Position>,
 
@@ -96,11 +67,8 @@ pub struct App {
     source_scroll_x: u16,
     latex_size: Size,
     latex_scroll_rows: u16,
-    preview_size: Size,
-    preview_scroll_rows: u16,
     source_area: Rect,
     latex_area: Rect,
-    preview_area: Rect,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -198,7 +166,7 @@ impl App {
         let worker_events = events_tx.clone();
         thread::spawn(move || build_worker(worker_requests, worker_events));
         let encoded_events = events_tx.clone();
-        let strips = StripPreview::new(picker.clone(), move |encoded| {
+        let preview = PreviewPane::new(picker, move |encoded| {
             encoded_events
                 .send(LoopEvent::PreviewEncoded(encoded))
                 .is_ok()
@@ -220,7 +188,6 @@ impl App {
             terminal_error: None,
             status: PipelineStatus::Waiting,
             diagnostic_span: None,
-            preview_warnings: Vec::new(),
             spinner_frame: 0,
             last_spinner_tick: Instant::now(),
             source_characters: 0,
@@ -229,25 +196,15 @@ impl App {
             sent: BTreeMap::new(),
             typeset_revision: None,
             sync: None,
-            page_count: 0,
-            page_index: 0,
-            page: None,
-            requested_view: None,
-            picker,
-            strips,
-            sync_target: None,
-            highlight: None,
+            preview,
             caret: None,
             source_size: Size::default(),
             source_scroll_y: 0,
             source_scroll_x: 0,
             latex_size: Size::default(),
             latex_scroll_rows: 0,
-            preview_size: Size::default(),
-            preview_scroll_rows: 0,
             source_area: Rect::default(),
             latex_area: Rect::default(),
-            preview_area: Rect::default(),
         };
         app.refresh_source_state();
         app
@@ -339,7 +296,7 @@ impl App {
                 self.handle_preview_event(event);
                 true
             }
-            LoopEvent::PreviewEncoded(encoded) => match self.strips.accept(encoded) {
+            LoopEvent::PreviewEncoded(encoded) => match self.preview.accept_encoded(encoded) {
                 Ok(changed) => changed,
                 Err(error) => {
                     self.status = PipelineStatus::Error(format!("terminal image error: {error}"));
@@ -385,11 +342,11 @@ impl App {
             return;
         }
         if key.code == KeyCode::Up && key.modifiers.contains(KeyModifiers::CONTROL) {
-            self.scroll_preview(-3);
+            self.preview.scroll(-3);
             return;
         }
         if key.code == KeyCode::Down && key.modifiers.contains(KeyModifiers::CONTROL) {
-            self.scroll_preview(3);
+            self.preview.scroll(3);
             return;
         }
 
@@ -503,12 +460,12 @@ impl App {
                 }
             }
             PaneFocus::Preview => match key.code {
-                _ if up => self.scroll_preview(-1),
-                _ if down => self.scroll_preview(1),
+                _ if up => self.preview.scroll(-1),
+                _ if down => self.preview.scroll(1),
                 KeyCode::PageUp => self.change_page(-1),
                 KeyCode::PageDown => self.change_page(1),
-                KeyCode::Home => self.scroll_preview(i16::MIN),
-                KeyCode::End => self.scroll_preview(i16::MAX),
+                KeyCode::Home => self.preview.scroll(i16::MIN),
+                KeyCode::End => self.preview.scroll(i16::MAX),
                 _ => return false,
             },
         }
@@ -615,25 +572,8 @@ impl App {
             PreviewEvent::Preparing if !empty => self.status = PipelineStatus::Preparing,
             PreviewEvent::Preparing => {}
             PreviewEvent::Failed(message) => self.status = PipelineStatus::Error(message),
-            PreviewEvent::Warnings(warnings) => {
-                for warning in warnings {
-                    if !self.preview_warnings.contains(&warning) {
-                        self.preview_warnings.push(warning);
-                    }
-                }
-                let excess = self
-                    .preview_warnings
-                    .len()
-                    .saturating_sub(MAX_PREVIEW_WARNINGS);
-                self.preview_warnings.drain(..excess);
-            }
-            PreviewEvent::Page(page) => {
-                self.page_count = page.pages;
-                if page.index == self.page_index {
-                    self.page = Some(page);
-                    self.present_preview();
-                }
-            }
+            PreviewEvent::Warnings(warnings) => self.preview.add_warnings(warnings),
+            PreviewEvent::Page(page) => self.preview.accept_page(page),
             PreviewEvent::Finished {
                 revision,
                 pages,
@@ -645,10 +585,8 @@ impl App {
                 self.typeset_revision = Some(revision);
                 self.sync = sync;
                 self.sent = self.sent.split_off(&revision);
-                self.page_count = pages;
-                if pages > 0 && self.page_index >= pages {
-                    self.select_page(pages - 1);
-                }
+                self.preview
+                    .set_page_count(pages, |view| self.pipeline.send(view));
                 if newest == Some(revision) && !empty {
                     match messages.iter().find(|message| message.error) {
                         Some(error) => {
@@ -710,152 +648,12 @@ impl App {
             }
             _ => None,
         };
-        self.sync_target = target;
-        if let Some(target) = target
-            && target.page != self.page_index
-            && target.page < self.page_count
-        {
-            self.select_page(target.page);
-        }
-        self.present_preview();
-    }
-
-    /// Install the visible preview, first scrolling just enough to show the whole sync target
-    /// and marking it for highlighting.
-    fn present_preview(&mut self) {
-        self.highlight = None;
-        if let (Some(target), Some(page)) = (self.sync_target, &self.page)
-            && target.page == self.page_index
-        {
-            let height = page.image.height();
-            let top = (target.top * page.scale).floor().max(0.0) as u32;
-            let bottom = ((target.bottom * page.scale).ceil().max(0.0) as u32).min(height);
-            let font_height = u32::from(self.picker.font_size().height.max(1));
-            let viewport = u32::from(self.preview_size.height.max(1)) * font_height;
-            let max_scroll = height.saturating_sub(viewport);
-            let max_rows = max_scroll.div_ceil(font_height);
-            let crop = (u32::from(self.preview_scroll_rows) * font_height).min(max_scroll);
-
-            let rows = if top < crop || bottom.saturating_sub(top) > viewport {
-                Some(top / font_height)
-            } else if bottom > crop + viewport {
-                Some((bottom - viewport).div_ceil(font_height))
-            } else {
-                None
-            };
-            if let Some(rows) = rows {
-                self.preview_scroll_rows = rows.min(max_rows).min(u32::from(u16::MAX)) as u16;
-            }
-            self.highlight = Some((top, bottom));
-        }
-        self.install_visible_preview();
-    }
-
-    /// Hand the visible rows of the page and the highlight to the strip encoder, which composes,
-    /// compares and encodes them off the UI thread.
-    fn install_visible_preview(&mut self) {
-        let Some(page) = &self.page else {
-            return;
-        };
-        if self.preview_size.width == 0 || self.preview_size.height == 0 {
-            return;
-        }
-        let image = &page.image;
-        let font = self.picker.font_size();
-        let font_height = u32::from(font.height.max(1));
-        let viewport_height = (u32::from(self.preview_size.height) * font_height).max(1);
-        let max_y = image.height().saturating_sub(viewport_height);
-        let y = (u32::from(self.preview_scroll_rows) * font_height).min(max_y);
-        self.preview_scroll_rows = (y / font_height) as u16;
-
-        let key = PreviewViewport {
-            fingerprint: page.fingerprint,
-            page_index: page.index,
-            image_width: image.width(),
-            pane_width: self.preview_size.width,
-            pane_height: self.preview_size.height,
-            crop_y: y,
-            scale: page.scale,
-            highlight: self.highlight,
-        };
-        if self.strips.holds(&key) {
-            return;
-        }
-
-        self.strips.install(
-            key,
-            Canvas {
-                page: Arc::clone(&page.image),
-                top: y,
-                height: viewport_height,
-                highlight: self.highlight,
-                tint: Theme::default().accent_rgb(),
-                max_width: u32::from(self.preview_size.width) * u32::from(font.width),
-            },
-        );
-    }
-
-    fn scroll_preview(&mut self, rows: i16) {
-        let Some(page) = &self.page else {
-            return;
-        };
-        let font_height = u32::from(self.picker.font_size().height.max(1));
-        let viewport = u32::from(self.preview_size.height.max(1)) * font_height;
-        let max_rows = page
-            .image
-            .height()
-            .saturating_sub(viewport)
-            .div_ceil(font_height) as u16;
-        self.preview_scroll_rows = self
-            .preview_scroll_rows
-            .saturating_add_signed(rows)
-            .min(max_rows);
-        self.install_visible_preview();
+        self.preview.follow(target, |view| self.pipeline.send(view));
     }
 
     fn change_page(&mut self, delta: isize) {
-        if self.page_count == 0 {
-            return;
-        }
-        let next = self
-            .page_index
-            .saturating_add_signed(delta)
-            .min(self.page_count - 1);
-        self.sync_target = None;
-        self.highlight = None;
-        self.select_page(next);
-    }
-
-    fn select_page(&mut self, index: usize) {
-        if index == self.page_index {
-            return;
-        }
-        self.page_index = index;
-        self.preview_scroll_rows = 0;
-        // The shown strips stay until the new page's image arrives, so nothing flashes blank.
-        self.page = None;
-        self.request_view();
-    }
-
-    /// The preview pane's width in pixels, or `None` while the pane has no area.
-    fn target_width(&self) -> Option<u32> {
-        (self.preview_size.width > 0)
-            .then(|| u32::from(self.preview_size.width) * u32::from(self.picker.font_size().width))
-    }
-
-    /// Tell the pipeline which page to keep rendered, at the pane's width.
-    fn request_view(&mut self) {
-        let Some(width) = self.target_width() else {
-            return;
-        };
-        let view = (self.page_index, width);
-        if self.requested_view != Some(view) {
-            self.requested_view = Some(view);
-            self.pipeline.send(PreviewCommand::View {
-                page: view.0,
-                width: view.1,
-            });
-        }
+        self.preview
+            .change_page(delta, |view| self.pipeline.send(view));
     }
 
     fn scroll_latex(&mut self, rows: i16) {
@@ -877,7 +675,7 @@ impl App {
         matches!(
             self.status,
             PipelineStatus::Waiting | PipelineStatus::Preparing | PipelineStatus::Typesetting
-        ) || self.strips.is_staging()
+        ) || self.preview.is_staging()
     }
 
     fn advance_spinner(&mut self) -> bool {
@@ -900,7 +698,7 @@ impl App {
                     self.place_source_cursor(mouse.column, mouse.row);
                 } else if contains(self.latex_area, mouse.column, mouse.row) {
                     self.focus = PaneFocus::Latex;
-                } else if contains(self.preview_area, mouse.column, mouse.row) {
+                } else if contains(self.preview.area(), mouse.column, mouse.row) {
                     self.focus = PaneFocus::Preview;
                     self.sync_from_preview_click(mouse.column, mouse.row);
                 }
@@ -912,41 +710,13 @@ impl App {
     }
 
     /// Move the source cursor to the note line typeset under a preview click.
-    ///
-    /// The click is mapped back through the width fit `install_visible_preview` applied to the
-    /// shown canvas (drawn from the pane's top-left corner), then from page pixels to points.
     fn sync_from_preview_click(&mut self, column: u16, row: u16) -> bool {
-        let (Some(view), Some(sync), Some(document)) = (
-            self.strips.shown_key(),
-            self.sync.clone(),
-            self.typeset_document(),
-        ) else {
+        let (Some(sync), Some(document)) = (&self.sync, self.typeset_document()) else {
             return false;
         };
-        let inner = self.preview_area.inner(ratatui::layout::Margin::new(1, 1));
-        if !self.strips.is_visible() || view.scale <= 0.0 || !contains(inner, column, row) {
-            return false;
-        }
-
-        let font = self.picker.font_size();
-        let (font_width, font_height) = (f64::from(font.width), f64::from(font.height));
-        let pane_width = f64::from(inner.width) * font_width;
-        let ratio = (pane_width / f64::from(view.image_width.max(1))).min(1.0);
-        let x = (f64::from(column - inner.x) + 0.5) * font_width / ratio;
-        let y = (f64::from(row - inner.y) + 0.5) * font_height / ratio;
-        if x >= f64::from(view.image_width) {
-            return false;
-        }
-
-        let scale = f64::from(view.scale);
-        let Some(byte) = sync
-            .backward(
-                view.page_index,
-                (x / scale) as f32,
-                ((y + f64::from(view.crop_y)) / scale) as f32,
-                |line| document.is_content_line(line),
-            )
-            .and_then(|line| document.source_byte_for_output_line(line))
+        let Some(byte) = self
+            .preview
+            .note_byte_at(column, row, sync, document)
             .map(|byte| map_offset_across_edit(document.note(), &self.buffer.text(), byte))
         else {
             return false;
@@ -972,9 +742,9 @@ impl App {
         } else if contains(self.latex_area, column, row) {
             self.focus = PaneFocus::Latex;
             self.scroll_latex(rows);
-        } else if contains(self.preview_area, column, row) {
+        } else if contains(self.preview.area(), column, row) {
             self.focus = PaneFocus::Preview;
-            self.scroll_preview(rows);
+            self.preview.scroll(rows);
         }
     }
 
@@ -1034,16 +804,12 @@ impl App {
         latex_size: Size,
         preview_size: Size,
     ) {
-        let resized = preview_size != self.preview_size;
         self.source_size = source_size;
         self.latex_size = latex_size;
-        self.preview_size = preview_size;
         self.latex_scroll_rows = self.latex_scroll_rows.min(self.max_latex_scroll());
         self.ensure_cursor_visible();
-        if resized {
-            self.request_view();
-            self.install_visible_preview();
-        }
+        self.preview
+            .resize(preview_size, |view| self.pipeline.send(view));
     }
 
     pub(crate) fn configure_pane_areas(
@@ -1054,7 +820,7 @@ impl App {
     ) {
         self.source_area = source_area;
         self.latex_area = latex_area;
-        self.preview_area = preview_area;
+        self.preview.set_area(preview_area);
     }
 
     pub(crate) fn source_line_count(&self) -> usize {
@@ -1118,7 +884,7 @@ impl App {
     }
 
     pub(crate) fn preview_warnings(&self) -> &[String] {
-        &self.preview_warnings
+        self.preview.warnings()
     }
 
     pub(crate) fn latex_scroll(&self) -> u16 {
@@ -1149,11 +915,9 @@ impl App {
                         elapsed.as_millis()
                     ),
                 };
-                if !self.preview_warnings.is_empty() {
-                    status.push_str(&format!(
-                        " · {} preview warning(s), see F1",
-                        self.preview_warnings.len()
-                    ));
+                let preview_warnings = self.preview.warnings().len();
+                if preview_warnings > 0 {
+                    status.push_str(&format!(" · {preview_warnings} preview warning(s), see F1"));
                 }
                 status
             }
@@ -1162,19 +926,15 @@ impl App {
     }
 
     pub(crate) fn page_label(&self) -> String {
-        if self.page_count == 0 {
-            String::from("no page")
-        } else {
-            format!("page {}/{}", self.page_index + 1, self.page_count)
-        }
+        self.preview.page_label()
     }
 
     pub(crate) fn protocol_label(&self) -> String {
-        format!("{:?}", self.picker.protocol_type())
+        self.preview.protocol_label()
     }
 
     pub(crate) fn has_preview(&self) -> bool {
-        self.strips.is_visible()
+        self.preview.has_preview()
     }
 
     pub(crate) fn preview_placeholder(&self) -> &'static str {
@@ -1186,7 +946,7 @@ impl App {
     }
 
     pub(crate) fn render_preview(&mut self, area: Rect, buf: &mut Buffer) {
-        self.strips.render(area, buf);
+        self.preview.render(area, buf);
     }
 }
 
@@ -1220,7 +980,8 @@ fn spawn_terminal_reader(events: mpsc::Sender<LoopEvent>) {
 mod tests {
     use super::*;
     use crate::driver::TexMessage;
-    use image::ImageBuffer;
+    use crate::preview_pane::MAX_PREVIEW_WARNINGS;
+    use crate::preview_pane::tests::white_page;
 
     fn press(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -1259,26 +1020,12 @@ mod tests {
     fn wait_for_encoded_strips(app: &mut App) {
         for _ in 0..200 {
             app.process_background_events();
-            if !app.strips.is_staging() {
+            if !app.preview.is_staging() {
                 return;
             }
             thread::sleep(Duration::from_millis(5));
         }
         panic!("timed out waiting for terminal preview encoding");
-    }
-
-    fn white_page(index: usize, width: u32, height: u32, fingerprint: u64) -> RenderedPage {
-        RenderedPage {
-            index,
-            pages: 1,
-            fingerprint,
-            scale: 1.0,
-            image: Arc::new(ImageBuffer::from_pixel(
-                width,
-                height,
-                Rgba([255, 255, 255, 255]),
-            )),
-        }
     }
 
     fn finished(revision: u64, messages: Vec<TexMessage>, sync: Option<SyncIndex>) -> LoopEvent {
@@ -1434,7 +1181,7 @@ mod tests {
     #[test]
     fn the_pane_width_is_requested_from_the_pipeline() {
         let app = recording_app();
-        let width = 20 * u32::from(app.picker.font_size().width);
+        let width = 20 * u32::from(app.preview.font_size().width);
         assert!(recorded(&app).iter().any(|command| matches!(
             command,
             PreviewCommand::View { page: 0, width: requested } if *requested == width
@@ -1448,11 +1195,11 @@ mod tests {
         assert_eq!(app.status_line(), "ready in 12 ms");
         let target = sync.forward(beta).expect("beta has a line box");
         let (top, bottom) = (target.top.floor() as u32, target.bottom.ceil() as u32);
-        assert_eq!(app.highlight, Some((top, bottom)));
+        assert_eq!(app.preview.highlight(), Some((top, bottom)));
 
-        let font_height = u32::from(app.picker.font_size().height);
-        let viewport = u32::from(app.preview_size.height) * font_height;
-        let crop = u32::from(app.preview_scroll_rows) * font_height;
+        let font_height = u32::from(app.preview.font_size().height);
+        let viewport = u32::from(app.preview.size().height) * font_height;
+        let crop = u32::from(app.preview.scroll_rows()) * font_height;
         assert!(crop > 0);
         assert!(crop <= top && bottom <= crop + viewport);
     }
@@ -1487,13 +1234,13 @@ mod tests {
     fn typing_on_the_highlighted_line_keeps_the_encoded_preview() {
         let (mut app, _, _) = synced_app();
         wait_for_encoded_strips(&mut app);
-        let highlight = app.highlight;
+        let highlight = app.preview.highlight();
 
         app.handle_event(Event::Key(press(KeyCode::Char('x'))));
 
         assert_ne!(Some(app.revision), app.typeset_revision);
-        assert_eq!(app.highlight, highlight);
-        assert!(!app.strips.is_staging());
+        assert_eq!(app.preview.highlight(), highlight);
+        assert!(!app.preview.is_staging());
     }
 
     #[test]
@@ -1507,9 +1254,9 @@ mod tests {
             Rect::new(70, 0, 22, 10),
         );
 
-        let view = app.strips.shown_key().expect("preview is encoded");
+        let view = app.preview.shown_viewport().expect("preview is encoded");
         let (top, bottom) = view.highlight.expect("beta is highlighted");
-        let font_height = u32::from(app.picker.font_size().height);
+        let font_height = u32::from(app.preview.font_size().height);
         let row = 1 + ((top + bottom) / 2 - view.crop_y) / font_height;
         app.handle_mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
@@ -1520,43 +1267,6 @@ mod tests {
 
         assert_eq!(app.focus(), PaneFocus::Source);
         assert_eq!(app.cursor_line_column(), (1, 0));
-    }
-
-    #[test]
-    fn a_change_within_one_cell_row_re_encodes_only_that_strip() {
-        let mut app = recording_app();
-        let font = app.picker.font_size();
-        let (width, height) = (20 * u32::from(font.width), 8 * u32::from(font.height));
-        app.handle_loop_event(LoopEvent::Preview(PreviewEvent::Page(white_page(
-            0, width, height, 1,
-        ))));
-        wait_for_encoded_strips(&mut app);
-        assert!(app.has_preview());
-        assert_eq!(
-            app.strips.last_encoded().len(),
-            8,
-            "the first install encodes every strip"
-        );
-
-        let mut page = ImageBuffer::from_pixel(width, height, Rgba([255, 255, 255, 255]));
-        let row_top = 3 * u32::from(font.height);
-        for y in row_top + 1..row_top + 4 {
-            for x in 0..width / 2 {
-                page.put_pixel(x, y, Rgba([0, 0, 0, 255]));
-            }
-        }
-        let mut changed = white_page(0, width, height, 2);
-        changed.image = Arc::new(page);
-        app.handle_loop_event(LoopEvent::Preview(PreviewEvent::Page(changed)));
-
-        assert!(app.strips.is_staging());
-        assert!(
-            app.has_preview(),
-            "the shown strips stay while the new ones are encoded"
-        );
-        wait_for_encoded_strips(&mut app);
-        assert_eq!(app.strips.last_encoded(), &[3]);
-        assert!(app.has_preview());
     }
 
     #[test]
