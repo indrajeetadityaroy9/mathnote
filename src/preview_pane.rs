@@ -204,7 +204,7 @@ impl PreviewPane {
                 top: y,
                 height: viewport_height,
                 highlight: self.highlight,
-                tint: Theme::default().accent_rgb(),
+                tint: Some(Theme::default().highlight_tint),
                 max_width,
             },
         );

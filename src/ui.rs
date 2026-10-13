@@ -64,7 +64,7 @@ fn render_source(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) -> Rec
     let lines: Vec<Line<'static>> = (first_line..end_line)
         .map(|line_index| {
             let style = if diagnostic_line == Some(line_index) {
-                Style::default().fg(Color::White).bg(theme.error)
+                Style::default().fg(theme.background).bg(theme.error)
             } else {
                 Style::default().fg(theme.foreground)
             };
