@@ -3,7 +3,7 @@
 //! Public API summary:
 //! - [`ensure_cache_warm`] makes the cache usable, bootstrapping it online when needed.
 //! - [`open_bundle`] opens the pinned bundle; with `only_cached` it never touches the network.
-//! - [`FormatCache`] stores the compiled format; [`default_cache_dir`] locates the cache.
+//! - [`default_cache_dir`] locates the cache.
 //!
 //! Bundle integrity:
 //! One exact format-33 URL is used, and the bundle is rejected unless Tectonic reports the
@@ -30,21 +30,21 @@ use std::{
 };
 
 use directories::ProjectDirs;
-use tectonic_bridge_core::{CoreBridgeLauncher, DriverHooks};
+use tectonic_bridge_core::CoreBridgeLauncher;
 use tectonic_bundles::{Bundle, detect_bundle};
 use tectonic_engine_xetex::{FORMAT_SERIAL, TexEngine, TexOutcome};
 use tectonic_io_base::{InputHandle, InputOrigin, IoProvider, OpenResult, OutputHandle};
 use tectonic_status_base::{MessageKind, StatusBackend};
 
 use crate::dvi::{BundleFontFiles, FontStore, XdvDocument, render_page};
-use crate::engine::PRIMARY_INPUT_NAME;
+use crate::engine::{Hooks, PRIMARY_INPUT_NAME, XDV_OUTPUT_NAME};
 use crate::{document::Document, latex::TEMPLATE_MATH_FONTS, latex::emit_latex};
 
 const FORMAT_VERSION: u32 = 33;
 // The pinned bundle's format files must match the linked engine.
 const _: () = assert!(FORMAT_VERSION == FORMAT_SERIAL);
 /// Name of the LaTeX format, as the engine requests it.
-const FORMAT_NAME: &str = "latex";
+pub(crate) const FORMAT_NAME: &str = "latex";
 const BUNDLE_URL: &str = "https://data1b.fullyjustified.net/tlextras-2022.0r0.tar";
 const BUNDLE_DIGEST: &str = "6ffe055852f8faf66c0acbe1a7fb27f87b869a90bad1204f3bf4d9683f597c7c";
 const CACHE_READY_MARKER: &str = "bundle-v33.ready";
@@ -65,7 +65,7 @@ pub enum CacheError {
         message: String,
     },
     Bundle(String),
-    /// The bootstrap document failed to typeset; the messages are Tectonic's.
+    /// The warm-up failed; `details` are the engine's or the page renderer's messages.
     Bootstrap {
         message: String,
         details: Vec<String>,
@@ -91,8 +91,9 @@ impl Display for CacheError {
 
 impl std::error::Error for CacheError {}
 
-pub fn cache_is_warmed() -> bool {
-    cache_marker_is_valid(&default_cache_dir())
+/// Whether the cache in `cache_dir` carries a valid ready marker.
+pub(crate) fn cache_is_warmed(cache_dir: &Path) -> bool {
+    cache_marker_is_valid(cache_dir)
 }
 
 /// Make the cache usable: bootstrap it when its ready marker is missing, and rebuild it once
@@ -113,17 +114,16 @@ pub fn ensure_cache_warm(cache_dir: &Path) -> Result<(), CacheError> {
     warm_cache(cache_dir)
 }
 
-/// Compiled format files, one per format name for the pinned bundle. File names follow
-/// Tectonic's own format cache (`<bundle digest>-<format>-<serial>.fmt`), so caches made before
-/// stay valid.
-pub struct FormatCache {
+/// Compiled format files, one per format name for the pinned bundle:
+/// `<bundle digest>-<format>-<serial>.fmt`.
+pub(crate) struct FormatCache {
     dir: PathBuf,
 }
 
 impl FormatCache {
-    pub fn new(cache_dir: &Path) -> Self {
+    pub(crate) fn new(cache_dir: &Path) -> Self {
         Self {
-            dir: cache_dir.join("formats"),
+            dir: formats_dir(cache_dir),
         }
     }
 
@@ -160,16 +160,8 @@ impl IoProvider for FormatCache {
         data: &[u8],
         _status: &mut dyn StatusBackend,
     ) -> tectonic_errors::Result<()> {
-        static STAGED: AtomicU64 = AtomicU64::new(0);
         fs::create_dir_all(&self.dir)?;
-        let path = self.path(name);
-        let staged = path.with_extension(format!(
-            "fmt-{}-{}.tmp",
-            std::process::id(),
-            STAGED.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::write(&staged, data)?;
-        fs::rename(&staged, &path)?;
+        replace_atomically(&self.path(name), "fmt", data)?;
         Ok(())
     }
 }
@@ -207,7 +199,7 @@ fn warm_cache(cache_dir: &Path) -> Result<(), CacheError> {
         FormatCache::new(cache_dir)
             .write_format(FORMAT_NAME, &format, &mut status)
             .map_err(|error| CacheError::Directory {
-                path: cache_dir.join("formats"),
+                path: formats_dir(cache_dir),
                 message: format!("{error:#}"),
             })?;
     }
@@ -220,7 +212,7 @@ fn warm_cache(cache_dir: &Path) -> Result<(), CacheError> {
         PRIMARY_INPUT_NAME,
     )?;
     let xdv = outputs
-        .get("mathnote.xdv")
+        .get(XDV_OUTPUT_NAME)
         .ok_or_else(|| CacheError::Bootstrap {
             message: String::from("the warm-up note produced no XDV output"),
             details: Vec::new(),
@@ -228,9 +220,7 @@ fn warm_cache(cache_dir: &Path) -> Result<(), CacheError> {
 
     // Render through the page renderer's own lookups, then load the math fonts at every size
     // the template can produce (script-script digits use cmr6), so their files are cached too.
-    let mut fonts = FontStore::new(Box::new(BundleFontFiles::new(open_bundle(
-        cache_dir, false,
-    )?)));
+    let mut fonts = FontStore::new(BundleFontFiles::new(open_bundle(cache_dir, false)?));
     let mut pages = XdvDocument::new();
     pages.update(xdv, None);
     for index in 0..pages.page_count() {
@@ -265,14 +255,12 @@ fn warmup_tex(
     input_name: &str,
 ) -> Result<HashMap<String, Vec<u8>>, CacheError> {
     let outputs = Rc::new(RefCell::new(HashMap::new()));
-    let mut hooks = WarmupHooks {
-        io: WarmupIo {
-            primary,
-            outputs: Rc::clone(&outputs),
-            formats: FormatCache::new(cache_dir),
-            bundle: open_bundle(cache_dir, false)?,
-        },
-    };
+    let mut hooks = Hooks(WarmupIo {
+        primary,
+        outputs: Rc::clone(&outputs),
+        formats: FormatCache::new(cache_dir),
+        bundle: open_bundle(cache_dir, false)?,
+    });
     let mut status = CapturingStatus::default();
     let outcome = {
         let mut launcher = CoreBridgeLauncher::new(&mut hooks, &mut status);
@@ -388,19 +376,9 @@ impl Drop for MemoryOutput {
     }
 }
 
-struct WarmupHooks {
-    io: WarmupIo,
-}
-
-impl DriverHooks for WarmupHooks {
-    fn io(&mut self) -> &mut dyn IoProvider {
-        &mut self.io
-    }
-}
-
 /// Open the pinned bundle and verify its digest. `only_cached` locks it to the local cache.
 pub fn open_bundle(cache_dir: &Path, only_cached: bool) -> Result<Box<dyn Bundle>, CacheError> {
-    for path in [cache_dir.to_path_buf(), cache_dir.join("formats")] {
+    for path in [cache_dir.to_path_buf(), formats_dir(cache_dir)] {
         fs::create_dir_all(&path).map_err(|error| CacheError::Directory {
             path: path.clone(),
             message: error.to_string(),
@@ -437,6 +415,24 @@ fn cached_bundle_dir(cache_dir: &Path) -> PathBuf {
     cache_dir.join("data").join(BUNDLE_DIGEST)
 }
 
+fn formats_dir(cache_dir: &Path) -> PathBuf {
+    cache_dir.join("formats")
+}
+
+/// Write `data` to a temporary file unique per process and call, then rename it over `path`, so
+/// concurrent readers (threads and other processes) see the old or the new file, never a partial
+/// one. The temporary file's extension is `<staged_ext>-<pid>-<n>.tmp`.
+fn replace_atomically(path: &Path, staged_ext: &str, data: &[u8]) -> io::Result<()> {
+    static STAGED: AtomicU64 = AtomicU64::new(0);
+    let staged = path.with_extension(format!(
+        "{staged_ext}-{}-{}.tmp",
+        std::process::id(),
+        STAGED.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::write(&staged, data)?;
+    fs::rename(&staged, path)
+}
+
 /// Keep `tectonic_bundles` from performing its seven-day remote digest refresh in cache-only
 /// mode. The digest was verified during bootstrap and is also bound into our ready marker.
 ///
@@ -469,17 +465,12 @@ fn refresh_cached_digest_check(cache_dir: &Path) -> Result<(), String> {
             continue;
         }
         if fs::read_to_string(&path).is_ok_and(|contents| contents.trim() == BUNDLE_DIGEST) {
-            // Unique per process and call: threads of one process refresh concurrently too.
-            static STAGED: AtomicU64 = AtomicU64::new(0);
-            let lock = path.with_extension("lock");
-            let staged = path.with_extension(format!(
-                "lock-{}-{}.tmp",
-                std::process::id(),
-                STAGED.fetch_add(1, Ordering::Relaxed)
-            ));
-            fs::write(&staged, now.to_string())
-                .and_then(|()| fs::rename(&staged, &lock))
-                .map_err(|error| format!("could not lock bundle cache to offline mode: {error}"))?;
+            replace_atomically(
+                &path.with_extension("lock"),
+                "lock",
+                now.to_string().as_bytes(),
+            )
+            .map_err(|error| format!("could not lock bundle cache to offline mode: {error}"))?;
             return Ok(());
         }
     }
@@ -492,7 +483,7 @@ fn refresh_cached_digest_check(cache_dir: &Path) -> Result<(), String> {
 fn invalidate_cache(cache_dir: &Path) {
     let _ = fs::remove_file(cache_dir.join(CACHE_READY_MARKER));
     let _ = fs::remove_dir_all(cached_bundle_dir(cache_dir));
-    let _ = fs::remove_dir_all(cache_dir.join("formats"));
+    let _ = fs::remove_dir_all(formats_dir(cache_dir));
 }
 
 fn cache_marker_is_valid(cache_dir: &Path) -> bool {

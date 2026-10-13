@@ -3,9 +3,12 @@
 
 use std::time::{Duration, Instant};
 
-use mathnote::cache::{default_cache_dir, ensure_cache_warm};
+mod common;
+
+use common::driver;
+use mathnote::cache::default_cache_dir;
 use mathnote::document::Document;
-use mathnote::driver::{DriverConfig, EngineState, TexDriver};
+use mathnote::driver::{EngineState, TexDriver};
 use mathnote::dvi::{BundleFontFiles, FontStore, XdvDocument, render_page};
 use mathnote::latex::{LatexDocument, emit_latex};
 use mathnote::synctex::SyncIndex;
@@ -17,15 +20,6 @@ struct Typeset {
     latex: LatexDocument,
     xdv: XdvDocument,
     sync: SyncIndex,
-}
-
-fn driver() -> TexDriver {
-    let cache_dir = default_cache_dir();
-    ensure_cache_warm(&cache_dir).expect("Tectonic cache is usable");
-    TexDriver::new(DriverConfig {
-        engine_exe: env!("CARGO_BIN_EXE_mathnote").into(),
-        cache_dir,
-    })
 }
 
 fn typeset(driver: &mut TexDriver, note: &str) -> Typeset {
@@ -56,9 +50,8 @@ fn notes_typeset_to_rendered_pages() {
     let page = note.xdv.page(0).expect("first page");
     assert!(page.height > page.width, "A4 portrait");
 
-    let mut fonts = FontStore::new(Box::new(
-        BundleFontFiles::open(&default_cache_dir()).expect("bundle fonts"),
-    ));
+    let mut fonts =
+        FontStore::new(BundleFontFiles::open(&default_cache_dir()).expect("bundle fonts"));
     let image = render_page(page, &mut fonts, 900.0 / page.width);
     assert_eq!(image.width(), 900);
     let ink = image

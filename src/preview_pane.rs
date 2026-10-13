@@ -143,8 +143,8 @@ impl PreviewPane {
             let height = page.image.height();
             let top = (target.top * page.scale).floor().max(0.0) as u32;
             let bottom = ((target.bottom * page.scale).ceil().max(0.0) as u32).min(height);
-            let font_height = u32::from(self.picker.font_size().height.max(1));
-            let viewport = u32::from(self.size.height.max(1)) * font_height;
+            let font_height = self.font_height();
+            let viewport = self.viewport_height();
             let max_scroll = height.saturating_sub(viewport);
             let max_rows = max_scroll.div_ceil(font_height);
             let crop = (u32::from(self.scroll_rows) * font_height).min(max_scroll);
@@ -170,13 +170,15 @@ impl PreviewPane {
         let Some(page) = &self.page else {
             return;
         };
-        if self.size.width == 0 || self.size.height == 0 {
+        if self.size.height == 0 {
             return;
         }
+        let Some(max_width) = self.target_width() else {
+            return;
+        };
         let image = &page.image;
-        let font = self.picker.font_size();
-        let font_height = u32::from(font.height.max(1));
-        let viewport_height = (u32::from(self.size.height) * font_height).max(1);
+        let font_height = self.font_height();
+        let viewport_height = self.viewport_height();
         let max_y = image.height().saturating_sub(viewport_height);
         let y = (u32::from(self.scroll_rows) * font_height).min(max_y);
         self.scroll_rows = (y / font_height) as u16;
@@ -203,7 +205,7 @@ impl PreviewPane {
                 height: viewport_height,
                 highlight: self.highlight,
                 tint: Theme::default().accent_rgb(),
-                max_width: u32::from(self.size.width) * u32::from(font.width),
+                max_width,
             },
         );
     }
@@ -212,12 +214,11 @@ impl PreviewPane {
         let Some(page) = &self.page else {
             return;
         };
-        let font_height = u32::from(self.picker.font_size().height.max(1));
-        let viewport = u32::from(self.size.height.max(1)) * font_height;
+        let font_height = self.font_height();
         let max_rows = page
             .image
             .height()
-            .saturating_sub(viewport)
+            .saturating_sub(self.viewport_height())
             .div_ceil(font_height) as u16;
         self.scroll_rows = self.scroll_rows.saturating_add_signed(rows).min(max_rows);
         self.install_visible();
@@ -245,6 +246,16 @@ impl PreviewPane {
         // The shown strips stay until the new page's image arrives, so nothing flashes blank.
         self.page = None;
         self.request_view(send);
+    }
+
+    /// The height of one terminal cell in pixels, at least 1.
+    fn font_height(&self) -> u32 {
+        u32::from(self.picker.font_size().height.max(1))
+    }
+
+    /// The preview pane's height in pixels, counting at least one row.
+    fn viewport_height(&self) -> u32 {
+        u32::from(self.size.height.max(1)) * self.font_height()
     }
 
     /// The preview pane's width in pixels, or `None` while the pane has no area.

@@ -5,7 +5,6 @@ use std::ops::Range;
 pub struct MathSpan {
     span: Range<usize>,
     source: String,
-    cleaned: String,
     latex: String,
 }
 
@@ -16,10 +15,6 @@ impl MathSpan {
 
     pub fn source(&self) -> &str {
         &self.source
-    }
-
-    pub fn cleaned(&self) -> &str {
-        &self.cleaned
     }
 
     pub fn latex(&self) -> &str {
@@ -34,21 +29,21 @@ pub enum NoteSegment {
 }
 
 #[derive(Debug, Clone)]
-pub struct NoteLine {
+pub struct NoteParagraph {
     segments: Vec<NoteSegment>,
 }
 
-impl NoteLine {
-    /// Parses one mixed note line. Ordinary language remains prose while
-    /// complete, unambiguous mathematical phrases are detected and rendered.
-    /// Automatically inferred expressions are limited to 256 source bytes;
-    /// longer expressions must use explicit `$...$` delimiters.
+impl NoteParagraph {
+    /// Parses one mixed note paragraph, which may span several lines.
+    /// Ordinary language remains prose while complete, unambiguous
+    /// mathematical phrases are detected and rendered. Automatically inferred
+    /// expressions are limited to 256 source bytes; longer expressions must use
+    /// explicit `$...$` delimiters.
     pub fn parse(input: &str) -> Result<Self, NoteError> {
-        validate_explicit_math_delimiters(input)?;
         let mut segments = Vec::new();
         let mut cursor = 0;
 
-        for explicit in discover_explicit_math_ranges(input) {
+        for explicit in explicit_math_ranges(input)? {
             append_automatic_segments(&mut segments, input, cursor..explicit.full.start)?;
             segments.push(NoteSegment::Math(parse_math_span(
                 explicit.content.clone(),
@@ -67,43 +62,6 @@ impl NoteLine {
     pub fn segments(&self) -> &[NoteSegment] {
         &self.segments
     }
-
-    pub fn is_visually_empty(&self) -> bool {
-        self.segments.iter().all(|segment| match segment {
-            NoteSegment::Text(text) => text.trim().is_empty(),
-            NoteSegment::Math(math) => math.latex.trim().is_empty(),
-        })
-    }
-}
-
-fn validate_explicit_math_delimiters(input: &str) -> Result<(), NoteError> {
-    let mut opening = None;
-
-    for (byte, character) in input.char_indices() {
-        if character != '$' || is_escaped_delimiter(input, byte) {
-            continue;
-        }
-
-        if let Some(opening_byte) = opening.take() {
-            if input[opening_byte + 1..byte].trim().is_empty() {
-                return Err(NoteError::InvalidMath {
-                    byte: opening_byte,
-                    message: String::from("explicit mathematics cannot be empty"),
-                });
-            }
-        } else {
-            opening = Some(byte);
-        }
-    }
-
-    if let Some(byte) = opening {
-        return Err(NoteError::InvalidMath {
-            byte,
-            message: String::from("unclosed inline mathematics delimiter"),
-        });
-    }
-
-    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,7 +92,9 @@ struct ExplicitMathRange {
     content: Range<usize>,
 }
 
-fn discover_explicit_math_ranges(input: &str) -> Vec<ExplicitMathRange> {
+/// Pairs the unescaped `$` delimiters of `input`, rejecting an empty pair or an
+/// unclosed trailing delimiter.
+fn explicit_math_ranges(input: &str) -> Result<Vec<ExplicitMathRange>, NoteError> {
     let mut ranges = Vec::new();
     let mut opening = None;
 
@@ -145,18 +105,29 @@ fn discover_explicit_math_ranges(input: &str) -> Vec<ExplicitMathRange> {
 
         if let Some(opening_byte) = opening.take() {
             let content = opening_byte + 1..byte;
-            if !input[content.clone()].trim().is_empty() {
-                ranges.push(ExplicitMathRange {
-                    full: opening_byte..byte + 1,
-                    content,
+            if input[content.clone()].trim().is_empty() {
+                return Err(NoteError::InvalidMath {
+                    byte: opening_byte,
+                    message: String::from("explicit mathematics cannot be empty"),
                 });
             }
+            ranges.push(ExplicitMathRange {
+                full: opening_byte..byte + 1,
+                content,
+            });
         } else {
             opening = Some(byte);
         }
     }
 
-    ranges
+    if let Some(byte) = opening {
+        return Err(NoteError::InvalidMath {
+            byte,
+            message: String::from("unclosed inline mathematics delimiter"),
+        });
+    }
+
+    Ok(ranges)
 }
 
 fn is_escaped_delimiter(input: &str, byte: usize) -> bool {
@@ -311,11 +282,32 @@ fn tokenize_clauses(input: &str) -> Vec<Vec<Token>> {
 fn is_math_token_character(character: char) -> bool {
     character.is_alphanumeric()
         || character == '_'
-        || matches!(
-            character,
-            '+' | '-' | '=' | '<' | '>' | '/' | '^' | '×' | '≤' | '≥' | '≠' | '±' | '∞'
-        )
+        || is_operator_symbol(character)
+        || character == '∞'
 }
+
+fn is_operator_symbol(character: char) -> bool {
+    matches!(
+        character,
+        '+' | '-' | '=' | '<' | '>' | '/' | '^' | '×' | '≤' | '≥' | '≠' | '±'
+    )
+}
+
+fn is_operator_word(word: &str) -> bool {
+    matches!(
+        word,
+        "plus" | "minus" | "times" | "over" | "equals" | "less" | "greater" | "not"
+    )
+}
+
+const NUMBER_WORDS: [&str; 11] = [
+    "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+];
+
+const GREEK_NAMES: [&str; 14] = [
+    "alpha", "beta", "gamma", "delta", "epsilon", "theta", "lambda", "mu", "pi", "rho", "sigma",
+    "phi", "psi", "omega",
+];
 
 fn is_clause_boundary(character: char) -> bool {
     matches!(character, ',' | ';' | ':' | '.' | '!' | '?' | '\n')
@@ -328,28 +320,11 @@ fn candidate_has_safe_end(tokens: &[Token], end: usize, input: &str) -> bool {
 }
 
 fn is_continuation_operator(word: &str) -> bool {
-    matches!(
-        word,
-        "plus"
-            | "minus"
-            | "times"
-            | "over"
-            | "equals"
-            | "less"
-            | "greater"
-            | "not"
-            | "+"
-            | "-"
-            | "="
-            | "<"
-            | ">"
-            | "/"
-            | "×"
-            | "≤"
-            | "≥"
-            | "≠"
-            | "±"
-    )
+    is_operator_word(word)
+        || matches!(
+            word,
+            "+" | "-" | "=" | "<" | ">" | "/" | "×" | "≤" | "≥" | "≠" | "±"
+        )
 }
 
 fn is_complete_math_candidate(candidate: &str) -> bool {
@@ -370,12 +345,9 @@ fn is_compact_numeric_range(candidate: &str) -> bool {
 
 fn contains_math_trigger(input: &str) -> bool {
     contains_natural_operator(input)
-        || input.chars().any(|character| {
-            matches!(
-                character,
-                '+' | '-' | '=' | '<' | '>' | '/' | '^' | '×' | '≤' | '≥' | '≠' | '±' | '∞'
-            )
-        })
+        || input
+            .chars()
+            .any(|character| is_operator_symbol(character) || character == '∞')
 }
 
 fn parse_math_span(span: Range<usize>, source: &str) -> Result<MathSpan, NoteError> {
@@ -388,7 +360,6 @@ fn parse_math_span(span: Range<usize>, source: &str) -> Result<MathSpan, NoteErr
     Ok(MathSpan {
         span,
         source,
-        cleaned,
         latex,
     })
 }
@@ -398,15 +369,6 @@ fn collapse_whitespace(input: &str) -> String {
 }
 
 pub(crate) fn normalize_math(source: &str) -> Result<String, String> {
-    let unicode_normalized = source.chars().fold(String::new(), |mut output, character| {
-        if let Some(command) = unicode_math_command(character) {
-            output.push_str(command);
-        } else {
-            output.push(character);
-        }
-        output
-    });
-
     if contains_natural_operator(source) {
         if source
             .chars()
@@ -421,36 +383,33 @@ pub(crate) fn normalize_math(source: &str) -> Result<String, String> {
 
     if contains_symbolic_operator(source) {
         validate_symbolic_expression(source)?;
-        return Ok(unicode_normalized);
+        return Ok(source.chars().fold(String::new(), |mut output, character| {
+            if let Some(command) = unicode_math_command(character) {
+                output.push_str(command);
+            } else {
+                output.push(character);
+            }
+            output
+        }));
     }
 
     if source.trim() == "∞" {
         return Ok(String::from(r"\infty"));
     }
 
-    if !contains_natural_operator(source) {
-        let words = source.split_whitespace().collect::<Vec<_>>();
-        let normalized = words
-            .iter()
-            .map(|word| normalize_natural_atom(word))
-            .collect::<Result<Vec<_>, _>>()?;
-        return if normalized.is_empty() {
-            Err(String::from("not a complete mathematical expression"))
-        } else {
-            Ok(normalized.join(" "))
-        };
+    let normalized = source
+        .split_whitespace()
+        .map(normalize_natural_atom)
+        .collect::<Result<Vec<_>, _>>()?;
+    if normalized.is_empty() {
+        Err(String::from("not a complete mathematical expression"))
+    } else {
+        Ok(normalized.join(" "))
     }
-
-    Err(String::from("not a complete mathematical expression"))
 }
 
 fn contains_symbolic_operator(input: &str) -> bool {
-    input.chars().any(|character| {
-        matches!(
-            character,
-            '+' | '-' | '=' | '<' | '>' | '/' | '^' | '×' | '≤' | '≥' | '≠' | '±'
-        )
-    })
+    input.chars().any(is_operator_symbol)
 }
 
 fn validate_symbolic_expression(input: &str) -> Result<(), String> {
@@ -495,10 +454,7 @@ fn validate_symbolic_expression(input: &str) -> Result<(), String> {
             continue;
         }
 
-        if matches!(
-            characters[position],
-            '+' | '-' | '=' | '<' | '>' | '/' | '^' | '×' | '≤' | '≥' | '≠' | '±'
-        ) {
+        if is_operator_symbol(characters[position]) {
             operator_count += 1;
             position += 1;
             if position < characters.len()
@@ -524,22 +480,12 @@ fn validate_symbolic_expression(input: &str) -> Result<(), String> {
 
 fn contains_natural_operator(input: &str) -> bool {
     input.split_whitespace().any(|word| {
-        matches!(
-            word.to_ascii_lowercase().as_str(),
-            "plus"
-                | "minus"
-                | "times"
-                | "over"
-                | "equals"
-                | "less"
-                | "greater"
-                | "not"
-                | "squared"
-                | "cubed"
-                | "square"
-                | "root"
-                | "integral"
-        )
+        let word = word.to_ascii_lowercase();
+        is_operator_word(&word)
+            || matches!(
+                word.as_str(),
+                "squared" | "cubed" | "square" | "root" | "integral"
+            )
     })
 }
 
@@ -551,26 +497,14 @@ fn normalize_single_atom(atom: &str) -> String {
         return command.to_owned();
     }
 
-    match atom.to_ascii_lowercase().as_str() {
-        "zero" => String::from("0"),
-        "one" => String::from("1"),
-        "two" => String::from("2"),
-        "three" => String::from("3"),
-        "four" => String::from("4"),
-        "five" => String::from("5"),
-        "six" => String::from("6"),
-        "seven" => String::from("7"),
-        "eight" => String::from("8"),
-        "nine" => String::from("9"),
-        "ten" => String::from("10"),
-        "alpha" | "beta" | "gamma" | "delta" | "epsilon" | "theta" | "lambda" | "mu" | "pi"
-        | "rho" | "sigma" | "phi" | "psi" | "omega" => {
-            format!(r"\{}", atom.to_ascii_lowercase())
-        }
+    let lower = atom.to_ascii_lowercase();
+    if let Some(value) = NUMBER_WORDS.iter().position(|word| *word == lower) {
+        return value.to_string();
+    }
+    match lower.as_str() {
+        word if GREEK_NAMES.contains(&word) => format!(r"\{word}"),
         "infinity" => String::from(r"\infty"),
-        "sin" | "cos" | "tan" | "log" | "ln" | "exp" | "min" | "max" => {
-            format!(r"\{}", atom.to_ascii_lowercase())
-        }
+        "sin" | "cos" | "tan" | "log" | "ln" | "exp" | "min" | "max" => format!(r"\{lower}"),
         _ => atom.to_string(),
     }
 }
@@ -641,35 +575,9 @@ pub(crate) fn unicode_math_command(character: char) -> Option<&'static str> {
 
 fn normalize_natural_atom(atom: &str) -> Result<String, String> {
     let lower = atom.to_ascii_lowercase();
-    let is_named_constant = matches!(
-        lower.as_str(),
-        "zero"
-            | "one"
-            | "two"
-            | "three"
-            | "four"
-            | "five"
-            | "six"
-            | "seven"
-            | "eight"
-            | "nine"
-            | "ten"
-            | "alpha"
-            | "beta"
-            | "gamma"
-            | "delta"
-            | "epsilon"
-            | "theta"
-            | "lambda"
-            | "mu"
-            | "pi"
-            | "rho"
-            | "sigma"
-            | "phi"
-            | "psi"
-            | "omega"
-            | "infinity"
-    );
+    let is_named_constant = NUMBER_WORDS.contains(&lower.as_str())
+        || GREEK_NAMES.contains(&lower.as_str())
+        || lower == "infinity";
     let is_number = atom.chars().all(|character| character.is_ascii_digit())
         || (atom.matches('.').count() == 1
             && atom
@@ -828,12 +736,9 @@ impl<'a> NaturalMathParser<'a> {
     }
 
     fn next_word_is_operator(&self) -> bool {
-        self.words.get(self.position).is_some_and(|word| {
-            matches!(
-                word.to_ascii_lowercase().as_str(),
-                "plus" | "minus" | "times" | "over" | "equals" | "less" | "greater" | "not"
-            )
-        })
+        self.words
+            .get(self.position)
+            .is_some_and(|word| is_operator_word(&word.to_ascii_lowercase()))
     }
 
     fn consume_word(&mut self, expected: &str) -> bool {
@@ -869,24 +774,7 @@ impl<'a> NaturalMathParser<'a> {
 fn integration_variable(words: &[&str]) -> Option<String> {
     words.iter().find_map(|word| {
         let normalized = normalize_natural_atom(word).ok()?;
-        let lower = word.to_ascii_lowercase();
-        let is_greek = matches!(
-            lower.as_str(),
-            "alpha"
-                | "beta"
-                | "gamma"
-                | "delta"
-                | "epsilon"
-                | "theta"
-                | "lambda"
-                | "mu"
-                | "pi"
-                | "rho"
-                | "sigma"
-                | "phi"
-                | "psi"
-                | "omega"
-        );
+        let is_greek = GREEK_NAMES.contains(&word.to_ascii_lowercase().as_str());
         let alphabetic_count = word
             .chars()
             .filter(|character| character.is_alphabetic())

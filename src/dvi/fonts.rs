@@ -28,12 +28,8 @@ use super::tfm::Tfm;
 use super::xdv::FontDef;
 use crate::cache::open_bundle;
 
-/// Source of font-related files (TFM, Type1, OpenType, map and encoding files) by name.
-pub trait FontFiles {
-    fn read(&mut self, name: &str) -> Option<Arc<[u8]>>;
-}
-
-/// [`FontFiles`] served from a Tectonic bundle.
+/// Font-related files (TFM, Type1, OpenType, map and encoding files) by name, served from a
+/// Tectonic bundle.
 pub struct BundleFontFiles {
     bundle: Box<dyn Bundle>,
 }
@@ -50,9 +46,7 @@ impl BundleFontFiles {
             .map(Self::new)
             .map_err(|error| error.to_string())
     }
-}
 
-impl FontFiles for BundleFontFiles {
     fn read(&mut self, name: &str) -> Option<Arc<[u8]>> {
         let mut status = NoopStatusBackend::default();
         match self.bundle.input_open_name(name, &mut status) {
@@ -92,7 +86,7 @@ enum Face {
 
 /// Loaded fonts and outline cache, shared by every page of a document.
 pub struct FontStore {
-    files: Box<dyn FontFiles>,
+    files: BundleFontFiles,
     /// `pdftex.map`, read on first use of a TFM font (`Some(None)` when it is unavailable).
     map: Option<Option<FontMap>>,
     tfms: HashMap<String, Option<Arc<Tfm>>>,
@@ -105,7 +99,7 @@ pub struct FontStore {
 }
 
 impl FontStore {
-    pub fn new(files: Box<dyn FontFiles>) -> Self {
+    pub fn new(files: BundleFontFiles) -> Self {
         Self {
             files,
             map: None,

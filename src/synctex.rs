@@ -13,10 +13,10 @@ use flate2::read::GzDecoder;
 
 /// The first file XeTeX opens, the job's primary input, always receives SyncTeX tag 1.
 const PRIMARY_TAG: u32 = 1;
-/// 65536 sp = 1 pt and 72.27 pt = 72 bp = 1 in.
-const SP_PER_POINT: f64 = 65536.0 * 72.27 / 72.0;
+/// Scaled points per big point: 65536 sp = 1 pt and 72.27 pt = 72 bp = 1 in.
+const SP_PER_BP: f64 = 65536.0 * 72.27 / 72.0;
 
-/// The typeset extent of a source line, in PDF points from the top-left page corner.
+/// The typeset extent of a source line, in big points (bp) from the top-left page corner.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SyncTarget {
     pub page: usize,
@@ -126,7 +126,7 @@ impl SyncIndex {
         Self::parse(&String::from_utf8_lossy(&text))
     }
 
-    /// Parse the complete line vocabulary XeTeX's `xetex-synctex.c` emits. Any other line, or a
+    /// Parse the complete line vocabulary XeTeX's SyncTeX writer emits. Any other line, or a
     /// record whose fields do not parse, makes the whole index untrustworthy.
     pub fn parse(text: &str) -> Result<Self, SyncError> {
         const IGNORED_HEADERS: [&str; 9] = [
@@ -149,13 +149,15 @@ impl SyncIndex {
         let mut form_depth = 0usize;
 
         for (index, line) in text.lines().enumerate() {
-            let malformed = SyncError::Malformed { line: index + 1 };
+            let malformed = || SyncError::Malformed { line: index + 1 };
             if let Some(value) = line.strip_prefix("Magnification:") {
-                magnification = positive(value).ok_or(malformed)?.unwrap_or(magnification);
+                magnification = positive(value)
+                    .ok_or_else(malformed)?
+                    .unwrap_or(magnification);
                 continue;
             }
             if let Some(value) = line.strip_prefix("Unit:") {
-                unit = positive(value).ok_or(malformed)?.unwrap_or(unit);
+                unit = positive(value).ok_or_else(malformed)?.unwrap_or(unit);
                 continue;
             }
             if IGNORED_HEADERS
@@ -167,19 +169,17 @@ impl SyncIndex {
 
             let mut characters = line.chars();
             let Some(kind) = characters.next() else {
-                return Err(malformed);
+                return Err(malformed());
             };
             let rest = characters.as_str();
             match kind {
                 '!' | 'f' | 'x' | 'h' | 'v' => {}
                 '<' => form_depth += 1,
-                '>' => form_depth = form_depth.checked_sub(1).ok_or(malformed)?,
+                '>' => form_depth = form_depth.checked_sub(1).ok_or_else(malformed)?,
                 _ if form_depth > 0 => {}
                 '{' => {
-                    let sheet: usize = rest.parse().map_err(|_| malformed)?;
-                    let page = sheet
-                        .checked_sub(1)
-                        .ok_or(SyncError::Malformed { line: index + 1 })?;
+                    let sheet: usize = rest.parse().map_err(|_| malformed())?;
+                    let page = sheet.checked_sub(1).ok_or_else(malformed)?;
                     if pages.len() <= page {
                         pages.resize_with(page + 1, RawPage::default);
                     }
@@ -187,23 +187,21 @@ impl SyncIndex {
                     stack.clear();
                 }
                 '}' => {
-                    rest.parse::<usize>().map_err(|_| malformed)?;
+                    rest.parse::<usize>().map_err(|_| malformed())?;
                     current = None;
                     stack.clear();
                 }
                 '[' => {
-                    current.ok_or(malformed)?;
+                    current.ok_or_else(malformed)?;
                     stack.push(None);
                 }
                 '(' => {
-                    let page = current.ok_or(SyncError::Malformed { line: index + 1 })?;
-                    let fields = RecordFields::parse(rest).ok_or(malformed)?;
+                    let page = current.ok_or_else(malformed)?;
+                    let fields = RecordFields::parse(rest).ok_or_else(malformed)?;
                     if stack.iter().any(Option::is_some) {
                         stack.push(None);
                     } else {
-                        let [width, height, depth] = fields
-                            .dims::<3>()
-                            .ok_or(SyncError::Malformed { line: index + 1 })?;
+                        let [width, height, depth] = fields.dims::<3>().ok_or_else(malformed)?;
                         let boxes = &mut pages[page].boxes;
                         boxes.push(RawBox {
                             h: fields.h,
@@ -216,11 +214,11 @@ impl SyncIndex {
                     }
                 }
                 ']' | ')' => {
-                    stack.pop().ok_or(malformed)?;
+                    stack.pop().ok_or_else(malformed)?;
                 }
                 'g' | 'k' | '$' | 'r' => {
-                    let page = current.ok_or(SyncError::Malformed { line: index + 1 })?;
-                    let fields = RecordFields::parse(rest).ok_or(malformed)?;
+                    let page = current.ok_or_else(malformed)?;
+                    let fields = RecordFields::parse(rest).ok_or_else(malformed)?;
                     let line_box = stack.iter().find_map(|level| *level);
                     if let (PRIMARY_TAG, Some(line_box)) = (fields.tag, line_box) {
                         pages[page].records.push(RawRecord {
@@ -230,11 +228,11 @@ impl SyncIndex {
                         });
                     }
                 }
-                _ => return Err(malformed),
+                _ => return Err(malformed()),
             }
         }
 
-        let points = |raw: i64| (raw as f64 * unit * magnification / 1000.0 / SP_PER_POINT) as f32;
+        let bp = |raw: i64| (raw as f64 * unit * magnification / 1000.0 / SP_PER_BP) as f32;
         let pages = pages
             .into_iter()
             .map(|page| SyncPage {
@@ -242,11 +240,11 @@ impl SyncIndex {
                     .boxes
                     .iter()
                     .map(|raw| LineBox {
-                        h: points(raw.h),
-                        v: points(raw.v),
-                        width: points(raw.width),
-                        height: points(raw.height),
-                        depth: points(raw.depth),
+                        h: bp(raw.h),
+                        v: bp(raw.v),
+                        width: bp(raw.width),
+                        height: bp(raw.height),
+                        depth: bp(raw.depth),
                     })
                     .collect(),
                 records: page
@@ -254,17 +252,13 @@ impl SyncIndex {
                     .iter()
                     .map(|raw| SyncRecord {
                         line: raw.line,
-                        h: points(raw.h),
+                        h: bp(raw.h),
                         line_box: raw.line_box,
                     })
                     .collect(),
             })
             .collect();
         Ok(Self { pages })
-    }
-
-    pub fn page_count(&self) -> usize {
-        self.pages.len()
     }
 
     /// The typeset extent of source line `line`: the union of the line boxes holding its records
@@ -300,7 +294,7 @@ impl SyncIndex {
         })
     }
 
-    /// The source line typeset at `(x, y)` (PDF points from the page's top-left corner).
+    /// The source line typeset at `(x, y)` (big points (bp) from the page's top-left corner).
     ///
     /// The line box containing the point, or else the nearest one, is searched for the first
     /// content record at or right of `x`: characters carry no records of their own, and the next
@@ -435,12 +429,12 @@ Count:9
 Post scriptum:
 ";
 
-    fn pt(raw: i64) -> f32 {
-        (raw as f64 / SP_PER_POINT) as f32
+    fn bp(raw: i64) -> f32 {
+        (raw as f64 / SP_PER_BP) as f32
     }
 
     fn band(v: i64) -> (f32, f32) {
-        (pt(v) - pt(655360), pt(v) + pt(196608))
+        (bp(v) - bp(655360), bp(v) + bp(196608))
     }
 
     fn index() -> SyncIndex {
@@ -450,7 +444,7 @@ Post scriptum:
     #[test]
     fn forward_spans_the_line_boxes_of_own_stamped_records() {
         let index = index();
-        assert_eq!(index.page_count(), 2);
+        assert_eq!(index.pages.len(), 2);
 
         let (top, bottom) = band(13156352);
         assert_eq!(
@@ -478,20 +472,20 @@ Post scriptum:
     fn backward_picks_the_first_content_record_at_or_right_of_the_click() {
         let index = index();
         let all = |_| true;
-        let baseline = pt(13156352);
+        let baseline = bp(13156352);
 
         assert_eq!(
-            index.backward(0, pt(9_000_000) - 1.0, baseline, all),
+            index.backward(0, bp(9_000_000) - 1.0, baseline, all),
             Some(12)
         );
-        assert_eq!(index.backward(0, pt(10_000_000), baseline, all), Some(13));
+        assert_eq!(index.backward(0, bp(10_000_000), baseline, all), Some(13));
         assert_eq!(
-            index.backward(0, pt(9_000_000), baseline, |line| line != 12),
+            index.backward(0, bp(9_000_000), baseline, |line| line != 12),
             Some(13)
         );
-        assert_eq!(index.backward(0, pt(6578176), pt(20000000), all), Some(14));
+        assert_eq!(index.backward(0, bp(6578176), bp(20000000), all), Some(14));
         assert_eq!(
-            index.backward(0, pt(20000000), pt(52625408), |line| line != 40),
+            index.backward(0, bp(20000000), bp(52625408), |line| line != 40),
             None
         );
         assert_eq!(index.backward(5, 0.0, 0.0, all), None);

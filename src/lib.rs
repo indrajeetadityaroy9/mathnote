@@ -9,7 +9,7 @@ mod layout;
 pub mod note;
 mod preview;
 mod preview_pane;
-pub mod protocol;
+mod protocol;
 pub mod strips;
 pub mod synctex;
 mod theme;

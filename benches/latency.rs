@@ -76,9 +76,7 @@ fn typeset_while_typing(cache_dir: &std::path::Path) -> Vec<Vec<u8>> {
 
 /// Page 0 of every revision at the preview width; prints render times.
 fn render_pages(cache_dir: &std::path::Path, revisions: &[Vec<u8>]) -> Vec<Arc<RgbaImage>> {
-    let mut fonts = FontStore::new(Box::new(
-        BundleFontFiles::open(cache_dir).expect("cached bundle opens"),
-    ));
+    let mut fonts = FontStore::new(BundleFontFiles::open(cache_dir).expect("cached bundle opens"));
     let mut images = Vec::new();
     let mut times = Vec::new();
     for xdv in revisions {
@@ -97,7 +95,7 @@ fn render_pages(cache_dir: &std::path::Path, revisions: &[Vec<u8>]) -> Vec<Arc<R
         "page render at {PAGE_WIDTH_PX} px: first {:.2} ms (loads fonts)",
         ms(times[0])
     );
-    report("page render after the first", &mut times[1..].to_vec());
+    report("page render after the first", &mut times[1..]);
     fonts.preload(TEMPLATE_MATH_FONTS);
     let warnings = fonts.take_warnings();
     assert!(warnings.is_empty(), "renderer warnings: {warnings:?}");
@@ -140,11 +138,8 @@ fn preview_updates(images: &[Arc<RgbaImage>]) {
         preview.accept(strips).expect("strips encode");
         assert!(!preview.is_staging());
     }
-    report("UI-thread preview install", &mut install[1..].to_vec());
-    report(
-        "install until strips are encoded",
-        &mut to_screen[1..].to_vec(),
-    );
+    report("UI-thread preview install", &mut install[1..]);
+    report("install until strips are encoded", &mut to_screen[1..]);
 
     let edits = changed.len().max(1);
     let total_rows: usize = changed.iter().sum();

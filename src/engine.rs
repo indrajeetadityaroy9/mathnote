@@ -28,23 +28,25 @@ use nix::sys::wait::waitpid;
 use nix::unistd::{ForkResult, Pid, fork};
 use tectonic_bridge_core::{CoreBridgeLauncher, DriverHooks};
 use tectonic_bundles::Bundle;
-use tectonic_engine_xetex::{TexEngine, TexOutcome};
+use tectonic_engine_xetex::TexEngine;
 use tectonic_io_base::{
     InputFeatures, InputHandle, InputOrigin, IoProvider, OpenResult, OutputHandle,
 };
 use tectonic_status_base::{MessageKind, StatusBackend};
 
-use crate::cache::{self, FormatCache};
+use crate::cache::{self, FORMAT_NAME, FormatCache};
 use crate::protocol::{
-    A_DONE, A_FORK, A_OPEN, A_PASS, A_READ, A_SIZE, C_FLSH, CLIENT_HANDSHAKE, ENGINE_CHANNEL_FD,
+    A_DONE, A_FORK, A_OPEN, A_PASS, A_READ, A_SIZE, CLIENT_HANDSHAKE, ENGINE_CHANNEL_FD,
     EngineChannel, Q_APND, Q_CLOS, Q_OPRD, Q_OPWR, Q_READ, Q_SEEN, Q_SIZE, SERVER_HANDSHAKE,
-    STDOUT_FID, read_exact_fd, send_child,
+    STDOUT_FID, send_child,
 };
 
 /// Name under which the driver serves the primary document.
-pub const PRIMARY_INPUT_NAME: &str = "mathnote.tex";
+pub(crate) const PRIMARY_INPUT_NAME: &str = "mathnote.tex";
+/// Name of the XDV output the engine writes.
+pub(crate) const XDV_OUTPUT_NAME: &str = "mathnote.xdv";
 /// Pseudo output carrying `kind\tmessage` status lines.
-pub const STATUS_OUTPUT_NAME: &str = "mathnote.status";
+pub(crate) const STATUS_OUTPUT_NAME: &str = "mathnote.status";
 
 /// Appends are coalesced up to this many bytes before they are sent.
 const APPEND_BUFFER: usize = 4096;
@@ -173,9 +175,7 @@ impl Client {
         if !self.append_buf.is_empty() {
             self.send_tag_raw(Q_APND);
             self.chan.send_i32(self.append_fid);
-            let data = std::mem::take(&mut self.append_buf);
-            self.chan.send_bytes(&data);
-            self.append_buf = data;
+            self.chan.send_bytes(&self.append_buf);
             self.append_buf.clear();
             self.check_done();
         }
@@ -198,19 +198,20 @@ impl Client {
         }
     }
 
-    /// Ask the driver to open `path`; `None` when it does not serve the file.
-    fn open(&mut self, fid: i32, path: &str, write: bool) -> Option<String> {
+    /// Ask the driver to open `path`; false when it does not serve the file.
+    fn open(&mut self, fid: i32, path: &str, write: bool) -> bool {
         self.send_tag(if write { Q_OPWR } else { Q_OPRD });
         self.chan.send_i32(fid);
         self.chan.send_bytes(path.as_bytes());
         match self.recv_tag() {
-            A_PASS => None,
+            A_PASS => false,
             A_OPEN => {
+                // The answer echoes the name; only its bytes need consuming.
                 let len = self.recv_u32() as usize;
                 let mut name = vec![0; len];
                 self.recv_exact(&mut name);
                 self.open_fids.push(fid);
-                Some(String::from_utf8_lossy(&name).into_owned())
+                true
             }
             _ => driver_gone(),
         }
@@ -319,19 +320,9 @@ impl Client {
                 drop(child_end);
                 // Wait for the driver's acknowledgement, ignoring flushes (buffers are empty).
                 self.pause();
-                loop {
-                    let mut answer = [0u8; 4];
-                    if read_exact_fd(self.chan.fd(), &mut answer).is_err() {
-                        driver_gone();
-                    }
-                    let tag = u32::from_le_bytes(answer);
-                    if tag == C_FLSH {
-                        continue;
-                    }
-                    if tag != A_DONE {
-                        driver_gone();
-                    }
-                    break;
+                let (tag, _) = self.chan.recv_tag().unwrap_or_else(|_| driver_gone());
+                if tag != A_DONE {
+                    driver_gone();
                 }
                 // Release the driver's end before waiting, so the child sees the driver exit.
                 drop(parent_end);
@@ -420,14 +411,14 @@ impl InputFeatures for DriverInput {
     fn try_seek(&mut self, pos: SeekFrom) -> tectonic_errors::Result<u64> {
         match pos {
             SeekFrom::Start(0) => {
-                // `ttstub_input_seek` with ofs 0: buf_pos would be -file_pos, never > 0.
+                // Rewind: drop the buffered bytes; the next read starts at 0.
                 self.file_pos = 0;
                 self.buf_pos = 0;
                 self.buf_len = 0;
                 Ok(0)
             }
             SeekFrom::Current(0) => Ok(u64::from(self.file_pos) + self.buf_pos as u64),
-            _ => Err(io::Error::other("primary input only rewinds to 0").into()),
+            _ => Err(io::Error::other("driver-served inputs only rewind to 0").into()),
         }
     }
 
@@ -487,15 +478,16 @@ impl IoProvider for EngineIo {
     fn output_open_name(&mut self, name: &str) -> OpenResult<OutputHandle> {
         let mut client = self.client.borrow_mut();
         let fid = client.next_fid();
-        match client.open(fid, name, true) {
-            Some(_) => OpenResult::Ok(OutputHandle::new(
+        if client.open(fid, name, true) {
+            OpenResult::Ok(OutputHandle::new(
                 name,
                 DriverOutput {
                     client: Rc::clone(&self.client),
                     fid,
                 },
-            )),
-            None => OpenResult::NotAvailable,
+            ))
+        } else {
+            OpenResult::NotAvailable
         }
     }
 
@@ -544,7 +536,9 @@ impl EngineIo {
     fn open_driver_input(&mut self, name: &str) -> Option<InputHandle> {
         let mut client = self.client.borrow_mut();
         let id = client.next_fid();
-        client.open(id, name, false)?;
+        if !client.open(id, name, false) {
+            return None;
+        }
         let generation = client.generation;
         Some(InputHandle::new(
             name,
@@ -563,13 +557,12 @@ impl EngineIo {
     }
 }
 
-struct EngineHooks {
-    io: EngineIo,
-}
+/// Runs the engine over the I/O provider it wraps.
+pub(crate) struct Hooks<I>(pub(crate) I);
 
-impl DriverHooks for EngineHooks {
+impl<I: IoProvider> DriverHooks for Hooks<I> {
     fn io(&mut self) -> &mut dyn IoProvider {
-        &mut self.io
+        &mut self.0
     }
 }
 
@@ -580,7 +573,7 @@ struct EngineStatus {
 }
 
 /// Escape `\`, newline and tab so each message stays one line.
-pub(crate) fn escape_status(message: &str) -> String {
+fn escape_status(message: &str) -> String {
     let mut escaped = String::with_capacity(message.len());
     for character in message.chars() {
         match character {
@@ -602,6 +595,7 @@ impl EngineStatus {
 }
 
 impl StatusBackend for EngineStatus {
+    /// Notes are dropped: the driver only reads errors and warnings.
     fn report(
         &mut self,
         kind: MessageKind,
@@ -609,7 +603,7 @@ impl StatusBackend for EngineStatus {
         err: Option<&tectonic_errors::Error>,
     ) {
         let kind = match kind {
-            MessageKind::Note => "note",
+            MessageKind::Note => return,
             MessageKind::Warning => "warning",
             MessageKind::Error => "error",
         };
@@ -621,64 +615,47 @@ impl StatusBackend for EngineStatus {
         self.line(kind, &message);
     }
 
-    fn dump_error_logs(&mut self, output: &[u8]) {
-        self.line("note", &String::from_utf8_lossy(output));
-    }
+    /// Dropped: the driver reads errors from the log output instead.
+    fn dump_error_logs(&mut self, _output: &[u8]) {}
 }
 
-fn run_tex(
-    client: &Shared,
-    status: &mut EngineStatus,
-    cache_dir: &Path,
-) -> Result<TexOutcome, String> {
+fn run_tex(client: &Shared, status: &mut EngineStatus, cache_dir: &Path) -> Result<(), String> {
     let bundle = cache::open_bundle(cache_dir, true).map_err(|error| error.to_string())?;
     let formats = FormatCache::new(cache_dir);
-    let mut hooks = EngineHooks {
-        io: EngineIo {
-            client: Rc::clone(client),
-            bundle,
-            formats,
-        },
-    };
+    let mut hooks = Hooks(EngineIo {
+        client: Rc::clone(client),
+        bundle,
+        formats,
+    });
     let mut launcher = CoreBridgeLauncher::new(&mut hooks, status);
-    let outcome = TexEngine::default()
+    let result = TexEngine::default()
         .halt_on_error_mode(false)
         .synctex(true)
         .build_date(SystemTime::UNIX_EPOCH)
-        .process(&mut launcher, "latex", PRIMARY_INPUT_NAME)
+        .process(&mut launcher, FORMAT_NAME, PRIMARY_INPUT_NAME)
+        .map(|_| ())
         .map_err(|error| format!("{error:#}"));
     // The process exits right after this run. Freeing the bundle's file index (about 135k
     // entries) would cost 25-35 ms per edit, and in a forked snapshot child every heap page it
     // touches is also copied first.
     std::mem::forget(hooks);
-    outcome
+    result
 }
 
 /// Entry point of `<exe> --tex-engine <cache_dir>`; never returns.
 pub fn run_engine_process(cache_dir: &Path) -> ! {
     let client: Shared = Rc::new(RefCell::new(Client::connect(ENGINE_CHANNEL_FD)));
     let fid = client.borrow_mut().next_fid();
-    if client
-        .borrow_mut()
-        .open(fid, STATUS_OUTPUT_NAME, true)
-        .is_none()
-    {
+    if !client.borrow_mut().open(fid, STATUS_OUTPUT_NAME, true) {
         client.borrow_mut().finish();
     }
     let mut status = EngineStatus {
         client: Rc::clone(&client),
         fid,
     };
-    let outcome = match run_tex(&client, &mut status, cache_dir) {
-        Ok(TexOutcome::Spotless) => "spotless",
-        Ok(TexOutcome::Warnings) => "warnings",
-        Ok(TexOutcome::Errors) => "errors",
-        Err(message) => {
-            status.line("error", &message);
-            "aborted"
-        }
-    };
-    status.line("outcome", outcome);
+    if let Err(message) = run_tex(&client, &mut status, cache_dir) {
+        status.line("error", &message);
+    }
     drop(status);
     let mut client = client.borrow_mut();
     client.finish()

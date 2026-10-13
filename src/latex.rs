@@ -32,10 +32,6 @@ impl LatexDocument {
         &self.body
     }
 
-    pub fn source_map(&self) -> &[SourceMapEntry] {
-        &self.source_map
-    }
-
     /// The note text this document was generated from.
     pub fn note(&self) -> &str {
         &self.note
@@ -60,23 +56,6 @@ impl LatexDocument {
     /// and overlaps a source-mapped output range. Template, separator, and `\[`/`\]` lines are not.
     pub fn is_content_line(&self, line: usize) -> bool {
         self.content_entry(line).is_some()
-    }
-
-    /// Every content line (see [`Self::is_content_line`]) in ascending order, in one pass over
-    /// the source: source-map output ranges are emitted in order and never overlap.
-    pub fn content_lines(&self) -> Vec<usize> {
-        let mut lines = Vec::new();
-        let mut entries = self.source_map.iter().peekable();
-        let mut start = 0;
-        for (index, text) in self.source.split('\n').enumerate() {
-            let end = start + text.len();
-            while entries.next_if(|entry| entry.output.end <= start).is_some() {}
-            if start < end && entries.peek().is_some_and(|entry| entry.output.start < end) {
-                lines.push(index + 1);
-            }
-            start = end + 1;
-        }
-        lines
     }
 
     /// The 1-based line of [`Self::source`] that typesets the note byte `byte`, if it is a
@@ -172,13 +151,13 @@ pub fn emit_latex(document: &Document) -> LatexDocument {
 
     for block in document.blocks() {
         match block {
-            Block::Paragraph { inlines, .. } => {
+            Block::Paragraph { inlines } => {
                 for inline in inlines {
                     match inline {
-                        Inline::Text { text, source } => {
-                            emitter.push_anchored(&escape_prose(text), source.clone(), TEXT_ANCHOR);
+                        Inline::Text { text, span } => {
+                            emitter.push_anchored(&escape_prose(text), span.clone(), TEXT_ANCHOR);
                         }
-                        Inline::Math { latex, span, .. } => {
+                        Inline::Math { latex, span } => {
                             emitter.push("\\(", None);
                             emitter.push(latex, Some(span.clone()));
                             emitter.push("\\)", None);
@@ -190,13 +169,13 @@ pub fn emit_latex(document: &Document) -> LatexDocument {
                 }
                 emitter.push("\n\n", None);
             }
-            Block::DisplayMath { latex, span, .. } => {
+            Block::DisplayMath { latex, span } => {
                 emitter.push("\\[\n", None);
                 emitter.push_anchored(latex, span.clone(), MATH_ANCHOR);
                 emitter.push_compiled(MATH_ANCHOR);
                 emitter.push("\n\\]\n\n", None);
             }
-            Block::Blank { .. } => {
+            Block::Blank => {
                 emitter.push("\n", None);
             }
         }
@@ -212,7 +191,7 @@ pub fn emit_latex(document: &Document) -> LatexDocument {
         source: format!("{TEMPLATE_PREFIX}{}{TEMPLATE_SUFFIX}", emitter.compiled),
         body: emitter.display,
         source_map,
-        note: document.source().to_owned(),
+        note: document.note().to_owned(),
     }
 }
 

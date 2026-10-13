@@ -1,6 +1,6 @@
 use mathnote::document::{Block, Document, Inline, TextBuffer, map_offset_across_edit};
 use mathnote::latex::{emit_latex, escape_prose};
-use mathnote::note::{NoteLine, NoteSegment};
+use mathnote::note::{NoteParagraph, NoteSegment};
 
 #[test]
 fn mixed_notes_preserve_english_and_emit_canonical_mathematics() {
@@ -31,7 +31,7 @@ fn mixed_notes_preserve_english_and_emit_canonical_mathematics() {
 #[test]
 fn incomplete_math_language_remains_prose() {
     let input = "The words square root remain readable, and a plus sign remains prose.";
-    let note = NoteLine::parse(input).expect("ordinary language");
+    let note = NoteParagraph::parse(input).expect("ordinary language");
     assert!(matches!(
         note.segments(),
         [NoteSegment::Text(text)] if text == input
@@ -41,7 +41,7 @@ fn incomplete_math_language_remains_prose() {
 #[test]
 fn long_trigger_free_clause_remains_prose() {
     let input = vec!["ordinary"; 10_000].join(" ");
-    let note = NoteLine::parse(&input).expect("long prose clause parses");
+    let note = NoteParagraph::parse(&input).expect("long prose clause parses");
 
     assert!(matches!(
         note.segments(),
@@ -53,7 +53,7 @@ fn long_trigger_free_clause_remains_prose() {
 fn long_clause_still_finds_a_short_automatic_expression() {
     let prose = vec!["ordinary"; 10_000].join(" ");
     let input = format!("{prose} x + y");
-    let note = NoteLine::parse(&input).expect("long mixed clause parses");
+    let note = NoteParagraph::parse(&input).expect("long mixed clause parses");
 
     assert!(matches!(
         note.segments(),
@@ -69,7 +69,8 @@ fn automatic_length_bound_is_fail_closed_without_limiting_explicit_math() {
     let digits = "1".repeat(300);
     let expression = format!("root of {digits}");
 
-    let automatic = NoteLine::parse(&expression).expect("oversized automatic input stays prose");
+    let automatic =
+        NoteParagraph::parse(&expression).expect("oversized automatic input stays prose");
     assert!(matches!(
         automatic.segments(),
         [NoteSegment::Text(text)] if text == &expression
@@ -77,7 +78,7 @@ fn automatic_length_bound_is_fail_closed_without_limiting_explicit_math() {
 
     let explicit_input = format!("${expression}$");
     let explicit =
-        NoteLine::parse(&explicit_input).expect("explicit math bypasses heuristic bound");
+        NoteParagraph::parse(&explicit_input).expect("explicit math bypasses heuristic bound");
     assert!(matches!(
         explicit.segments(),
         [NoteSegment::Math(math)]
@@ -168,7 +169,7 @@ fn rope_editor_is_multiline_unicode_safe_and_clearable() {
     assert_eq!(buffer.text(), "Proof: α.\nGiven root of 81");
 
     buffer.clear();
-    assert!(buffer.is_empty());
+    assert_eq!(buffer.text(), "");
     assert_eq!(buffer.cursor(), 0);
 }
 
@@ -182,12 +183,15 @@ fn inline_source_spans_remain_exact_after_hidden_delimiters() {
     let Inline::Math { span, .. } = &inlines[1] else {
         panic!("math expected");
     };
-    let Inline::Text { source, .. } = &inlines[2] else {
+    let Inline::Text {
+        span: text_span, ..
+    } = &inlines[2]
+    else {
         panic!("trailing text expected");
     };
 
     assert_eq!(&input[span.range()], "root of 81");
-    assert_eq!(&input[source.range()], " after");
+    assert_eq!(&input[text_span.range()], " after");
 }
 
 #[test]
@@ -213,18 +217,6 @@ fn compiled_lines_are_anchored_and_map_back_to_note_lines() {
     assert_eq!(latex.source_byte_for_output_line(gamma), Some(12));
     assert_eq!(latex.output_line_for_source_byte(11), None);
     assert!(!latex.is_content_line(beta + 1));
-}
-
-#[test]
-fn content_lines_lists_exactly_the_content_lines() {
-    let note = "alpha $x squared$\nbeta\n\n$$\nintegral of x\n$$\n\ngamma $root of 81$\ndelta\n";
-    let latex = emit_latex(&Document::parse(note).expect("note parses"));
-    let expected = (1..=latex.source().lines().count() + 1)
-        .filter(|line| latex.is_content_line(*line))
-        .collect::<Vec<_>>();
-
-    assert!(expected.len() >= 5);
-    assert_eq!(latex.content_lines(), expected);
 }
 
 #[test]

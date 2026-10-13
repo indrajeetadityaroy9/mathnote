@@ -20,7 +20,7 @@ use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sys::socket::{ControlMessage, ControlMessageOwned, MsgFlags, UnixAddr, recvmsg, sendmsg};
 
 /// A four-character tag read as a little-endian `u32`.
-pub const fn pack(tag: [u8; 4]) -> u32 {
+const fn pack(tag: [u8; 4]) -> u32 {
     u32::from_le_bytes(tag)
 }
 
@@ -31,7 +31,7 @@ pub const Q_APND: u32 = pack(*b"APND");
 pub const Q_CLOS: u32 = pack(*b"CLOS");
 pub const Q_SIZE: u32 = pack(*b"SIZE");
 pub const Q_SEEN: u32 = pack(*b"SEEN");
-pub const Q_CHLD: u32 = pack(*b"CHLD");
+const Q_CHLD: u32 = pack(*b"CHLD");
 
 pub const A_DONE: u32 = pack(*b"DONE");
 pub const A_PASS: u32 = pack(*b"PASS");
@@ -82,7 +82,7 @@ pub enum Answer {
 }
 
 impl Answer {
-    pub fn encode(&self, out: &mut Vec<u8>) {
+    fn encode(&self, out: &mut Vec<u8>) {
         match self {
             Answer::Done => put_u32(out, A_DONE),
             Answer::Pass => put_u32(out, A_PASS),
@@ -103,15 +103,15 @@ impl Answer {
     }
 }
 
-pub fn put_u32(out: &mut Vec<u8>, value: u32) {
+fn put_u32(out: &mut Vec<u8>, value: u32) {
     out.extend_from_slice(&value.to_le_bytes());
 }
 
-pub fn put_i32(out: &mut Vec<u8>, value: i32) {
+fn put_i32(out: &mut Vec<u8>, value: i32) {
     out.extend_from_slice(&value.to_le_bytes());
 }
 
-pub fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
+fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
     put_u32(out, bytes.len() as u32);
     out.extend_from_slice(bytes);
 }
@@ -121,7 +121,7 @@ fn broken_pipe(message: &str) -> io::Error {
 }
 
 /// Write every byte, retrying on `EINTR`.
-pub fn write_all_fd(fd: BorrowedFd<'_>, mut bytes: &[u8]) -> io::Result<()> {
+fn write_all_fd(fd: BorrowedFd<'_>, mut bytes: &[u8]) -> io::Result<()> {
     while !bytes.is_empty() {
         match nix::unistd::write(fd, bytes) {
             Ok(0) => return Err(broken_pipe("channel closed")),
@@ -134,7 +134,7 @@ pub fn write_all_fd(fd: BorrowedFd<'_>, mut bytes: &[u8]) -> io::Result<()> {
 }
 
 /// Read exactly `buf.len()` bytes without buffering (safe across `fork`), retrying on `EINTR`.
-pub fn read_exact_fd(fd: BorrowedFd<'_>, mut buf: &mut [u8]) -> io::Result<()> {
+fn read_exact_fd(fd: BorrowedFd<'_>, mut buf: &mut [u8]) -> io::Result<()> {
     while !buf.is_empty() {
         match nix::unistd::read(fd, buf) {
             Ok(0) => return Err(broken_pipe("channel closed")),
@@ -354,7 +354,7 @@ impl DriverChannel {
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "path is not UTF-8"))
     }
 
-    /// `channel_handshake`: wait for the engine greeting and answer it.
+    /// Wait for the engine greeting and answer it.
     pub fn handshake(&mut self, timeout: Duration) -> io::Result<()> {
         while self.buffered() < CLIENT_HANDSHAKE.len() {
             if !self.poll_readable(timeout) {
@@ -376,13 +376,12 @@ impl DriverChannel {
         self.flush()
     }
 
-    /// `channel_has_pending_query`: bytes are buffered, or the socket becomes readable (data or
-    /// EOF) within `timeout`.
+    /// Bytes are buffered, or the socket becomes readable (data or EOF) within `timeout`.
     pub fn has_pending(&self, timeout: Duration) -> bool {
         self.buffered() > 0 || self.poll_readable(timeout)
     }
 
-    /// `channel_peek_query`: the tag of the next query, without consuming it.
+    /// The tag of the next query, without consuming it.
     pub fn peek_tag(&mut self) -> io::Result<u32> {
         self.need(4)?;
         Ok(u32::from_le_bytes(
@@ -390,7 +389,7 @@ impl DriverChannel {
         ))
     }
 
-    /// `channel_read_query`.
+    /// Read and decode the next query; a CHLD takes the oldest received descriptor.
     pub fn read_query(&mut self) -> io::Result<Query> {
         let tag = self.take_u32()?;
         let time = self.take_u32()?;

@@ -9,7 +9,7 @@ use ratatui::widgets::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::App;
-use crate::app::PaneFocus;
+use crate::app::{PaneFocus, StatusTone};
 use crate::layout;
 use crate::theme::Theme;
 
@@ -31,11 +31,7 @@ pub(crate) fn render(frame: &mut Frame, app: &mut App) {
     app.set_caret(caret_position(app, source_inner));
     let latex_inner = render_generated_latex(frame, app, panes.latex, &theme);
     let preview_inner = render_preview(frame, app, panes.preview, &theme);
-    app.configure_layout(
-        source_inner.into(),
-        latex_inner.into(),
-        preview_inner.into(),
-    );
+    app.configure_layout(source_inner, latex_inner.into(), preview_inner.into());
     render_status(frame, app, status_area, &theme);
 
     if app.show_help() {
@@ -59,6 +55,7 @@ fn render_source(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) -> Rec
     ]));
 
     let diagnostic_line = app.diagnostic_line();
+    let cursor_line = app.cursor_line_column().0;
     let (scroll_y, scroll_x) = app.source_scroll();
     let first_line = usize::from(scroll_y);
     let end_line = first_line
@@ -82,7 +79,7 @@ fn render_source(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) -> Rec
                     .bg(theme.error)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(if line_index == app.cursor_line_column().0 {
+                Style::default().fg(if line_index == cursor_line {
                     theme.cursor
                 } else {
                     theme.muted
@@ -148,7 +145,7 @@ fn render_generated_latex(frame: &mut Frame, app: &App, area: Rect, theme: &Them
             Style::default().fg(theme.muted),
         ))
     } else {
-        Paragraph::new(body).style(Style::default().fg(theme.foreground))
+        Paragraph::new(body)
     };
     frame.render_widget(
         paragraph
@@ -214,15 +211,11 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) {
         Constraint::Length(hint_width),
     ]));
 
-    let status = app.status_line();
-    let status_color = if status.starts_with("error:") {
-        theme.error
-    } else if status.starts_with("ready") {
-        theme.success
-    } else if status == "type a note to begin" {
-        theme.muted
-    } else {
-        theme.warning
+    let status_color = match app.status_tone() {
+        StatusTone::Idle => theme.muted,
+        StatusTone::Working => theme.warning,
+        StatusTone::Ready => theme.success,
+        StatusTone::Error => theme.error,
     };
     let separator = || Span::styled(" │ ", Style::default().fg(theme.inactive));
     let mut spans = vec![Span::styled(
@@ -259,7 +252,10 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) {
         ));
     }
     spans.push(separator());
-    spans.push(Span::styled(status, Style::default().fg(status_color)));
+    spans.push(Span::styled(
+        app.status_line(),
+        Style::default().fg(status_color),
+    ));
     let line = Line::from(spans);
     frame.render_widget(Paragraph::new(line), left);
     if !hints.is_empty() {
@@ -308,7 +304,11 @@ fn render_help(frame: &mut Frame, preview_warnings: &[String], theme: &Theme) {
             "focus a pane, place the cursor, or jump from the preview",
             theme,
         ),
-        help_binding("Wheel", "scroll the pane under the pointer", theme),
+        help_binding(
+            "Wheel",
+            "move the cursor in the note, or scroll the LaTeX or preview pane",
+            theme,
+        ),
     ];
     if !preview_warnings.is_empty() {
         lines.push(help_heading("PREVIEW WARNINGS", theme));
@@ -359,7 +359,7 @@ fn panel_block<'a>(title: impl Into<Line<'a>>, focused: bool, theme: &Theme) -> 
         .style(Style::default().bg(theme.background).fg(theme.foreground))
 }
 
-pub(crate) fn source_gutter_width(line_count: usize, available: u16) -> u16 {
+fn source_gutter_width(line_count: usize, available: u16) -> u16 {
     let digits = line_count.max(1).ilog10() as u16 + 1;
     digits.saturating_add(1).min(available.saturating_sub(1))
 }
@@ -417,10 +417,14 @@ mod tests {
             .draw(|frame| render(frame, &mut app))
             .expect("render succeeds");
 
-        let buffer = terminal.backend().buffer();
-        (0..height)
+        screen_text(terminal.backend().buffer())
+    }
+
+    fn screen_text(buffer: &ratatui::buffer::Buffer) -> String {
+        let area = buffer.area;
+        (area.top()..area.bottom())
             .map(|y| {
-                (0..width)
+                (area.left()..area.right())
                     .filter_map(|x| buffer.cell((x, y)))
                     .map(|cell| cell.symbol())
                     .collect::<String>()
@@ -430,7 +434,7 @@ mod tests {
     }
 
     #[test]
-    fn status_bar_replaces_the_static_header() {
+    fn status_bar_shows_the_mode_focus_and_hints() {
         let screen = render_screen(100, 24, false);
         assert!(screen.contains("NATURAL NOTE"));
         assert!(screen.contains("GENERATED LATEX"));
@@ -440,8 +444,6 @@ mod tests {
         assert!(screen.contains("F1 HELP"));
         let status_row = screen.lines().last().expect("status row");
         assert!(status_row.ends_with(" F1 HELP │ F6 PANES │ PGUP/PGDN PAGE "));
-        assert!(!screen.contains("ZEN"));
-        assert!(!screen.contains("natural-language mathematics"));
     }
 
     #[test]
@@ -462,16 +464,7 @@ mod tests {
             .draw(|frame| render_help(frame, &warnings, &Theme::default()))
             .expect("render succeeds");
 
-        let buffer = terminal.backend().buffer();
-        let screen = (0..30)
-            .map(|y| {
-                (0..100)
-                    .filter_map(|x| buffer.cell((x, y)))
-                    .map(|cell| cell.symbol())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+        let screen = screen_text(terminal.backend().buffer());
         assert!(screen.contains("PREVIEW WARNINGS"));
         assert!(screen.contains("cmr6.pfb (for cmr6) is not available"));
     }
@@ -485,7 +478,7 @@ mod tests {
     }
 
     #[test]
-    fn rendered_cells_use_cyberpunk_surface_and_focus_colors() {
+    fn rendered_cells_use_the_theme_surface_and_focus_colors() {
         let backend = TestBackend::new(100, 24);
         let mut terminal = Terminal::new(backend).expect("test terminal");
         let mut app = App::default();

@@ -1,8 +1,7 @@
 //! Incremental DVI/XDV reader.
 //!
 //! Semantics follow DVItype; the XDV extensions (`define_native_font` 252, `set_glyphs` 253,
-//! `set_text_and_glyphs` 254) use the byte layouts XeTeX writes (`xetex-ext.c` `make_font_def`,
-//! `xetex-shipout.c`).
+//! `set_text_and_glyphs` 254) use the byte layouts XeTeX writes.
 //!
 //! [`XdvDocument::update`] is fed the whole engine output every time. Only complete pages
 //! (`bop..eop`) become [`XdvPage`]s; an unfinished page is scanned as far as the bytes go and
@@ -22,7 +21,7 @@ use std::sync::{Arc, OnceLock};
 use super::fonts::FontStore;
 
 /// A4 in big points, the page size when no special sets one.
-pub(crate) const DEFAULT_PAGE_SIZE: (f32, f32) = (595.2756, 841.8898);
+const DEFAULT_PAGE_SIZE: (f32, f32) = (595.2756, 841.8898);
 /// The DVI origin sits one inch from the page's top-left corner.
 const ORIGIN_BP: f64 = 72.0;
 /// Bytes of `bop` including the opcode: ten counts and the previous-page pointer.
@@ -38,10 +37,8 @@ pub(crate) enum FontDef {
     /// `fnt_def`: a TeX font, metrics from `<name>.tfm`.
     Tfm {
         name: String,
-        checksum: u32,
         /// Scaled size `s` in DVI units.
         scale: i32,
-        design_size: i32,
     },
     /// XDV `define_native_font`: an OpenType/TrueType file drawn by glyph id.
     Native {
@@ -49,7 +46,6 @@ pub(crate) enum FontDef {
         index: u32,
         /// Size in DVI units (TeX `Fixed` points).
         size: i32,
-        flags: u16,
         rgba: Option<u32>,
         extend: Option<i32>,
         slant: Option<i32>,
@@ -172,7 +168,7 @@ impl XdvPage {
                         for index in 0..count {
                             let dx = be_i32(&positions[index * 8..]);
                             let dy = be_i32(&positions[index * 8 + 4..]);
-                            let gid = u16::from_be_bytes([ids[index * 2], ids[index * 2 + 1]]);
+                            let gid = be_u16(&ids[index * 2..]);
                             items.push(Item::Glyph {
                                 font: Arc::clone(def),
                                 code: u32::from(gid),
@@ -809,9 +805,7 @@ fn decode(buf: &[u8]) -> Result<Option<(Op<'_>, usize)>, ()> {
             need!(size);
             let def = FontDef::Tfm {
                 name: String::from_utf8_lossy(&fields[14 + area..14 + area + name]).into_owned(),
-                checksum: be_u32(fields),
                 scale: be_i32(&fields[4..]),
-                design_size: be_i32(&fields[8..]),
             };
             (Op::FontDef(unsigned(arg, n), def), size)
         }
@@ -867,7 +861,6 @@ fn decode(buf: &[u8]) -> Result<Option<(Op<'_>, usize)>, ()> {
                 name,
                 index,
                 size: be_i32(&arg[4..]),
-                flags,
                 rgba,
                 extend: extend.map(|value| value as i32),
                 slant: slant.map(|value| value as i32),

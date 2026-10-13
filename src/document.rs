@@ -2,7 +2,7 @@ use std::ops::Range;
 
 use ropey::Rope;
 
-use crate::note::{NoteError, NoteLine, NoteSegment, normalize_math};
+use crate::note::{NoteError, NoteParagraph, NoteSegment, normalize_math};
 
 #[derive(Debug, Clone)]
 pub struct TextBuffer {
@@ -35,10 +35,6 @@ impl TextBuffer {
 
     pub fn text(&self) -> String {
         self.rope.to_string()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.rope.len_chars() == 0
     }
 
     pub fn is_blank(&self) -> bool {
@@ -78,6 +74,11 @@ impl TextBuffer {
     pub fn cursor_line_column(&self) -> (usize, usize) {
         let line = self.rope.char_to_line(self.cursor);
         (line, self.cursor - self.rope.line_to_char(line))
+    }
+
+    /// The line holding `byte` (clamped to the end of the text).
+    pub fn line_of_byte(&self, byte: usize) -> usize {
+        self.rope.byte_to_line(byte.min(self.rope.len_bytes()))
     }
 
     pub fn cursor_display_column(&self) -> usize {
@@ -236,13 +237,6 @@ pub struct SourceSpan {
 }
 
 impl SourceSpan {
-    pub fn new(range: Range<usize>) -> Self {
-        Self {
-            start: range.start,
-            end: range.end,
-        }
-    }
-
     pub fn range(&self) -> Range<usize> {
         self.start..self.end
     }
@@ -250,31 +244,15 @@ impl SourceSpan {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Inline {
-    Text {
-        text: String,
-        source: SourceSpan,
-    },
-    Math {
-        source: String,
-        latex: String,
-        span: SourceSpan,
-    },
+    Text { text: String, span: SourceSpan },
+    Math { latex: String, span: SourceSpan },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Block {
-    Paragraph {
-        inlines: Vec<Inline>,
-        source: SourceSpan,
-    },
-    DisplayMath {
-        source: String,
-        latex: String,
-        span: SourceSpan,
-    },
-    Blank {
-        source: SourceSpan,
-    },
+    Paragraph { inlines: Vec<Inline> },
+    DisplayMath { latex: String, span: SourceSpan },
+    Blank,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -285,7 +263,7 @@ pub struct SourceMapEntry {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Document {
-    source: String,
+    note: String,
     blocks: Vec<Block>,
 }
 
@@ -297,7 +275,6 @@ impl Document {
         let mut offset = 0;
         let mut display_start: Option<usize> = None;
         let mut display_content_start = 0;
-        let mut display_content = String::new();
 
         for line in input.split_inclusive('\n') {
             let line_start = offset;
@@ -307,26 +284,8 @@ impl Document {
 
             if display_start.is_some() {
                 if trimmed == "$$" {
-                    let leading = display_content.len() - display_content.trim_start().len();
-                    let trailing = display_content.len() - display_content.trim_end().len();
-                    let source = display_content.trim().to_owned();
-                    let latex =
-                        normalize_math(&source).map_err(|message| NoteError::InvalidMath {
-                            byte: display_content_start + leading,
-                            message,
-                        })?;
-                    blocks.push(Block::DisplayMath {
-                        source,
-                        latex,
-                        span: SourceSpan {
-                            start: display_content_start + leading,
-                            end: display_content_start + display_content.len() - trailing,
-                        },
-                    });
+                    blocks.push(display_math(input, display_content_start..line_start)?);
                     display_start = None;
-                    display_content.clear();
-                } else {
-                    display_content.push_str(line);
                 }
                 continue;
             }
@@ -339,32 +298,13 @@ impl Document {
                 flush_paragraph(&mut blocks, &mut paragraph, &mut paragraph_start)?;
                 let leading = line_no_newline.find("$$").unwrap_or(0);
                 let trailing = line_no_newline.rfind("$$").unwrap_or(line_no_newline.len());
-                let content_start = line_start + leading + 2;
-                let content_end = line_start + trailing;
-                let raw_source = &input[content_start..content_end];
-                let leading = raw_source.len() - raw_source.trim_start().len();
-                let trailing = raw_source.len() - raw_source.trim_end().len();
-                let source = raw_source.trim().to_owned();
-                let latex = normalize_math(&source).map_err(|message| NoteError::InvalidMath {
-                    byte: content_start + leading,
-                    message,
-                })?;
-                blocks.push(Block::DisplayMath {
-                    source,
-                    latex,
-                    span: SourceSpan {
-                        start: content_start + leading,
-                        end: content_end - trailing,
-                    },
-                });
+                blocks.push(display_math(
+                    input,
+                    line_start + leading + 2..line_start + trailing,
+                )?);
             } else if trimmed.is_empty() {
                 flush_paragraph(&mut blocks, &mut paragraph, &mut paragraph_start)?;
-                blocks.push(Block::Blank {
-                    source: SourceSpan {
-                        start: line_start,
-                        end: offset,
-                    },
-                });
+                blocks.push(Block::Blank);
             } else {
                 if paragraph_start.is_none() {
                     paragraph_start = Some(line_start);
@@ -381,18 +321,39 @@ impl Document {
         flush_paragraph(&mut blocks, &mut paragraph, &mut paragraph_start)?;
 
         Ok(Self {
-            source: input.to_owned(),
+            note: input.to_owned(),
             blocks,
         })
     }
 
-    pub fn source(&self) -> &str {
-        &self.source
+    /// The note text this document was parsed from.
+    pub fn note(&self) -> &str {
+        &self.note
     }
 
     pub fn blocks(&self) -> &[Block] {
         &self.blocks
     }
+}
+
+/// Builds the display-math block whose content is `input[content]`, with the
+/// span trimmed to the non-whitespace content.
+fn display_math(input: &str, content: Range<usize>) -> Result<Block, NoteError> {
+    let raw = &input[content.clone()];
+    let leading = raw.len() - raw.trim_start().len();
+    let trailing = raw.len() - raw.trim_end().len();
+    let start = content.start + leading;
+    let latex = normalize_math(raw.trim()).map_err(|message| NoteError::InvalidMath {
+        byte: start,
+        message,
+    })?;
+    Ok(Block::DisplayMath {
+        latex,
+        span: SourceSpan {
+            start,
+            end: content.end - trailing,
+        },
+    })
 }
 
 fn flush_paragraph(
@@ -403,8 +364,7 @@ fn flush_paragraph(
     let Some(start) = paragraph_start.take() else {
         return Ok(());
     };
-    let end = start + paragraph.len();
-    let parsed = NoteLine::parse(paragraph)?;
+    let parsed = NoteParagraph::parse(paragraph)?;
     let mut search_cursor = 0;
     let mut inlines = Vec::new();
     for segment in parsed.segments() {
@@ -421,12 +381,11 @@ fn flush_paragraph(
                 search_cursor = local_start + text.len();
                 inlines.push(Inline::Text {
                     text: text.clone(),
-                    source: span,
+                    span,
                 });
             }
             NoteSegment::Math(math) => {
                 inlines.push(Inline::Math {
-                    source: math.source().to_owned(),
                     latex: math.latex().to_owned(),
                     span: SourceSpan {
                         start: start + math.span().start,
@@ -437,10 +396,7 @@ fn flush_paragraph(
             }
         }
     }
-    blocks.push(Block::Paragraph {
-        inlines,
-        source: SourceSpan { start, end },
-    });
+    blocks.push(Block::Paragraph { inlines });
     paragraph.clear();
     Ok(())
 }

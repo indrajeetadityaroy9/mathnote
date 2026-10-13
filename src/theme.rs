@@ -22,9 +22,10 @@ pub(crate) struct Theme {
 impl Default for Theme {
     fn default() -> Self {
         Self {
-            // Shiki's Cyberpunk 2077 palette. Night City yellow is reserved
-            // for focus and commands, cyan for successful output, and red for
-            // diagnostics so state changes remain readable at a glance.
+            // A dark violet surface with three accents: yellow for focus, pane
+            // titles, key bindings, and in-progress or warning text; cyan for
+            // success and the current line number; red for errors and help
+            // headings.
             background: Color::Rgb(0x10, 0x0a, 0x18),
             foreground: Color::Rgb(0xe8, 0xe6, 0xf0),
             accent: Color::Rgb(0xfc, 0xee, 0x0a),
@@ -59,7 +60,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_palette_matches_shiki_cyberpunk_2077() {
+    fn default_palette_keeps_its_surface_and_accent_colors() {
         let theme = Theme::default();
         assert_eq!(theme.background, Color::Rgb(0x10, 0x0a, 0x18));
         assert_eq!(theme.accent, Color::Rgb(0xfc, 0xee, 0x0a));

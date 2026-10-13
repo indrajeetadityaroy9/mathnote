@@ -69,7 +69,7 @@ impl Tfm {
     }
 
     /// Width of `code` as a `fix_word`; 0 outside `bc..=ec` or for a missing character.
-    pub(crate) fn width_fix_word(&self, code: u32) -> i32 {
+    fn width_fix_word(&self, code: u32) -> i32 {
         let Some(offset) = code.checked_sub(u32::from(self.first_char)) else {
             return 0;
         };
@@ -88,7 +88,7 @@ impl Tfm {
 
 /// DVItype's `store_scaled`: multiply a `fix_word` by the font scale `s` exactly as TeX does, so
 /// that accumulated advances match the positions TeX computed.
-pub(crate) fn scale_fix_word(fix_word: i32, scale: i32) -> i32 {
+fn scale_fix_word(fix_word: i32, scale: i32) -> i32 {
     let mut z = i64::from(scale.max(0));
     let mut alpha: i64 = 16;
     while z >= 0o40000000 {
@@ -121,8 +121,8 @@ mod tests {
         }
         data.extend_from_slice(&0u32.to_be_bytes()); // checksum
         data.extend_from_slice(&(10i32 << 20).to_be_bytes()); // design size
-        data.extend_from_slice(&[1, 0, 0, 0]); // 'A' -> width 1
-        data.extend_from_slice(&[2, 0, 0, 0]); // 'B' -> width 2
+        data.extend_from_slice(&[1, 0, 0, 0]); // 'A': width index 1 (0.5)
+        data.extend_from_slice(&[2, 0, 0, 0]); // 'B': width index 2 (-0.25)
         for width in [0i32, 1 << 19, -(1 << 18)] {
             data.extend_from_slice(&width.to_be_bytes());
         }

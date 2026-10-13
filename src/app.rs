@@ -18,7 +18,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect, Size};
 use ratatui_image::picker::Picker;
 
-use crate::document::{Document, SourceSpan, TextBuffer, map_offset_across_edit};
+use crate::document::{Document, TextBuffer, map_offset_across_edit};
 use crate::latex::{LatexDocument, emit_latex};
 use crate::preview::{PreviewCommand, PreviewEvent, preview_thread};
 use crate::preview_pane::PreviewPane;
@@ -46,10 +46,9 @@ pub struct App {
     events_rx: mpsc::Receiver<LoopEvent>,
     terminal_error: Option<io::Error>,
     status: PipelineStatus,
-    diagnostic_span: Option<SourceSpan>,
+    diagnostic_byte: Option<usize>,
     spinner_frame: usize,
     last_spinner_tick: Instant,
-    source_characters: usize,
     source_words: usize,
 
     pipeline: PipelineLink,
@@ -62,7 +61,8 @@ pub struct App {
     /// Terminal cell of the editing caret for the frame being drawn.
     caret: Option<Position>,
 
-    source_size: Size,
+    /// The source pane's text area, right of the line-number gutter, as last drawn.
+    source_content: Rect,
     source_scroll_y: usize,
     source_scroll_x: u16,
     latex_size: Size,
@@ -106,6 +106,17 @@ enum PipelineStatus {
     Error(String),
 }
 
+/// How the status line reads at a glance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StatusTone {
+    /// The note is empty.
+    Idle,
+    /// Building or typesetting.
+    Working,
+    Ready,
+    Error,
+}
+
 /// Everything that can wake the UI loop, delivered through one channel.
 pub(crate) enum LoopEvent {
     Terminal(Event),
@@ -118,6 +129,7 @@ pub(crate) enum LoopEvent {
 /// Where revisions and views go.
 enum PipelineLink {
     /// No typesetting: unit tests.
+    #[cfg(test)]
     Detached,
     Thread(mpsc::Sender<PreviewCommand>),
     /// Records what would be sent, for tests.
@@ -128,6 +140,7 @@ enum PipelineLink {
 impl PipelineLink {
     fn send(&mut self, command: PreviewCommand) {
         match self {
+            #[cfg(test)]
             Self::Detached => {}
             Self::Thread(commands) => {
                 let _ = commands.send(command);
@@ -138,6 +151,7 @@ impl PipelineLink {
     }
 }
 
+#[cfg(test)]
 impl Default for App {
     /// An editor without a typesetting pipeline.
     fn default() -> Self {
@@ -187,10 +201,9 @@ impl App {
             events_rx,
             terminal_error: None,
             status: PipelineStatus::Waiting,
-            diagnostic_span: None,
+            diagnostic_byte: None,
             spinner_frame: 0,
             last_spinner_tick: Instant::now(),
-            source_characters: 0,
             source_words: 0,
             pipeline,
             sent: BTreeMap::new(),
@@ -198,7 +211,7 @@ impl App {
             sync: None,
             preview,
             caret: None,
-            source_size: Size::default(),
+            source_content: Rect::default(),
             source_scroll_y: 0,
             source_scroll_x: 0,
             latex_size: Size::default(),
@@ -256,7 +269,7 @@ impl App {
         execute!(terminal.backend_mut(), EndSynchronizedUpdate)
     }
 
-    pub(crate) fn handle_event(&mut self, event: Event) -> bool {
+    fn handle_event(&mut self, event: Event) -> bool {
         let before = (self.revision, self.buffer.cursor());
         let redraw = match event {
             Event::Key(key) => {
@@ -475,14 +488,12 @@ impl App {
     fn mark_edited(&mut self) {
         self.revision = self.revision.wrapping_add(1);
         self.submitted_revision = None;
-        self.diagnostic_span = None;
         self.refresh_source_state();
         self.ensure_cursor_visible();
     }
 
     fn refresh_source_state(&mut self) {
-        self.source_characters = self.buffer.len_chars();
-        self.diagnostic_span = None;
+        self.diagnostic_byte = None;
         if self.buffer.is_blank() {
             self.source_words = 0;
             self.latex_scroll_rows = 0;
@@ -513,7 +524,7 @@ impl App {
         true
     }
 
-    pub(crate) fn process_background_events(&mut self) -> bool {
+    fn process_background_events(&mut self) -> bool {
         let mut changed = false;
         while let Ok(event) = self.events_rx.try_recv() {
             changed |= self.handle_loop_event(event);
@@ -523,13 +534,16 @@ impl App {
 
     fn handle_worker_event(&mut self, event: WorkerEvent) {
         match event {
+            // Only revisions newer than the last one sent: an empty note is accepted without
+            // the worker, so a build still in flight from before it would otherwise follow it.
             WorkerEvent::Built {
                 revision,
                 document,
                 words,
             } if self
-                .generated_revision
-                .is_none_or(|generated| revision > generated) =>
+                .sent
+                .last_key_value()
+                .is_none_or(|(newest, _)| revision > *newest) =>
             {
                 self.source_words = words;
                 self.accept_built(revision, document);
@@ -541,10 +555,7 @@ impl App {
             } if revision == self.revision => {
                 self.generated_revision = None;
                 self.status = PipelineStatus::Error(message);
-                self.diagnostic_span = Some(SourceSpan {
-                    start: byte,
-                    end: byte.saturating_add(1),
-                });
+                self.diagnostic_byte = Some(byte);
             }
             _ => {}
         }
@@ -591,9 +602,9 @@ impl App {
                     match messages.iter().find(|message| message.error) {
                         Some(error) => {
                             self.status = PipelineStatus::Error(error.message.clone());
-                            self.diagnostic_span = error
+                            self.diagnostic_byte = error
                                 .tex_line
-                                .and_then(|line| self.note_span_for(revision, line));
+                                .and_then(|line| self.note_byte_for(revision, line));
                         }
                         None => {
                             self.status = PipelineStatus::Ready {
@@ -608,20 +619,20 @@ impl App {
         }
     }
 
-    /// The note position that `revision`'s source line `line` typesets, moved across edits made
+    /// The note byte that `revision`'s source line `line` typesets, moved across edits made
     /// since that revision. Lines inside a multi-line paragraph map to their own note line.
-    fn note_span_for(&self, revision: u64, line: usize) -> Option<SourceSpan> {
+    fn note_byte_for(&self, revision: u64, line: usize) -> Option<usize> {
         let document = self.sent.get(&revision)?;
         let byte = document.source_byte_for_output_line(line).or_else(|| {
             document
                 .source_span_for_output_line(line)
                 .map(|span| span.start)
         })?;
-        let start = map_offset_across_edit(document.note(), &self.buffer.text(), byte);
-        Some(SourceSpan {
-            start,
-            end: start.saturating_add(1),
-        })
+        Some(map_offset_across_edit(
+            document.note(),
+            &self.buffer.text(),
+            byte,
+        ))
     }
 
     /// The document the SyncTeX data belongs to.
@@ -693,12 +704,13 @@ impl App {
         }
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                if contains(self.source_area, mouse.column, mouse.row) {
+                let position = Position::new(mouse.column, mouse.row);
+                if self.source_area.contains(position) {
                     self.focus = PaneFocus::Source;
                     self.place_source_cursor(mouse.column, mouse.row);
-                } else if contains(self.latex_area, mouse.column, mouse.row) {
+                } else if self.latex_area.contains(position) {
                     self.focus = PaneFocus::Latex;
-                } else if contains(self.preview.area(), mouse.column, mouse.row) {
+                } else if self.preview.area().contains(position) {
                     self.focus = PaneFocus::Preview;
                     self.sync_from_preview_click(mouse.column, mouse.row);
                 }
@@ -710,26 +722,26 @@ impl App {
     }
 
     /// Move the source cursor to the note line typeset under a preview click.
-    fn sync_from_preview_click(&mut self, column: u16, row: u16) -> bool {
+    fn sync_from_preview_click(&mut self, column: u16, row: u16) {
         let (Some(sync), Some(document)) = (&self.sync, self.typeset_document()) else {
-            return false;
+            return;
         };
         let Some(byte) = self
             .preview
             .note_byte_at(column, row, sync, document)
             .map(|byte| map_offset_across_edit(document.note(), &self.buffer.text(), byte))
         else {
-            return false;
+            return;
         };
 
         self.buffer.set_cursor_byte(byte);
         self.focus = PaneFocus::Source;
         self.ensure_cursor_visible();
-        true
     }
 
     fn scroll_at(&mut self, column: u16, row: u16, rows: i16) {
-        if contains(self.source_area, column, row) {
+        let position = Position::new(column, row);
+        if self.source_area.contains(position) {
             self.focus = PaneFocus::Source;
             for _ in 0..rows.unsigned_abs() {
                 if rows < 0 {
@@ -739,31 +751,26 @@ impl App {
                 }
             }
             self.ensure_cursor_visible();
-        } else if contains(self.latex_area, column, row) {
+        } else if self.latex_area.contains(position) {
             self.focus = PaneFocus::Latex;
             self.scroll_latex(rows);
-        } else if contains(self.preview.area(), column, row) {
+        } else if self.preview.area().contains(position) {
             self.focus = PaneFocus::Preview;
             self.preview.scroll(rows);
         }
     }
 
     fn place_source_cursor(&mut self, column: u16, row: u16) {
-        let inner = self.source_area.inner(ratatui::layout::Margin::new(1, 1));
-        if !contains(inner, column, row) {
-            return;
-        }
-        let gutter = ui::source_gutter_width(self.source_line_count(), inner.width);
-        let content_x = inner.x.saturating_add(gutter);
-        if column < content_x {
+        let content = self.source_content;
+        if !content.contains(Position::new(column, row)) {
             return;
         }
         let line_index = self
             .source_scroll_y
-            .saturating_add(usize::from(row.saturating_sub(inner.y)))
+            .saturating_add(usize::from(row.saturating_sub(content.y)))
             .min(self.buffer.len_lines().saturating_sub(1));
         let target_display_column = usize::from(self.source_scroll_x)
-            .saturating_add(usize::from(column.saturating_sub(content_x)));
+            .saturating_add(usize::from(column.saturating_sub(content.x)));
         let line = self.buffer.line(line_index);
         let mut display_column = 0usize;
         let mut character_column = 0usize;
@@ -782,7 +789,7 @@ impl App {
 
     fn ensure_cursor_visible(&mut self) {
         let (line, _) = self.buffer.cursor_line_column();
-        let height = usize::from(self.source_size.height.max(1));
+        let height = usize::from(self.source_content.height.max(1));
         if line < self.source_scroll_y {
             self.source_scroll_y = line;
         } else if line >= self.source_scroll_y + height {
@@ -790,7 +797,7 @@ impl App {
         }
 
         let display_column = self.buffer.cursor_display_column().min(u16::MAX as usize) as u16;
-        let width = self.source_size.width.max(1);
+        let width = self.source_content.width.max(1);
         if display_column < self.source_scroll_x {
             self.source_scroll_x = display_column;
         } else if display_column >= self.source_scroll_x.saturating_add(width) {
@@ -800,11 +807,11 @@ impl App {
 
     pub(crate) fn configure_layout(
         &mut self,
-        source_size: Size,
+        source_content: Rect,
         latex_size: Size,
         preview_size: Size,
     ) {
-        self.source_size = source_size;
+        self.source_content = source_content;
         self.latex_size = latex_size;
         self.latex_scroll_rows = self.latex_scroll_rows.min(self.max_latex_scroll());
         self.ensure_cursor_visible();
@@ -865,7 +872,7 @@ impl App {
 
     pub(crate) fn source_stats(&self) -> (usize, Option<usize>, usize) {
         (
-            self.source_characters,
+            self.buffer.len_chars(),
             (self.generated_revision == Some(self.revision)).then_some(self.source_words),
             self.buffer.len_lines(),
         )
@@ -892,10 +899,8 @@ impl App {
     }
 
     pub(crate) fn diagnostic_line(&self) -> Option<usize> {
-        let span = self.diagnostic_span.as_ref()?;
-        let source = self.buffer.text();
-        let byte = span.start.min(source.len());
-        Some(source[..byte].bytes().filter(|byte| *byte == b'\n').count())
+        self.diagnostic_byte
+            .map(|byte| self.buffer.line_of_byte(byte))
     }
 
     pub(crate) fn status_line(&self) -> String {
@@ -925,6 +930,17 @@ impl App {
         }
     }
 
+    pub(crate) fn status_tone(&self) -> StatusTone {
+        match self.status {
+            PipelineStatus::Empty => StatusTone::Idle,
+            PipelineStatus::Waiting | PipelineStatus::Preparing | PipelineStatus::Typesetting => {
+                StatusTone::Working
+            }
+            PipelineStatus::Ready { .. } => StatusTone::Ready,
+            PipelineStatus::Error(_) => StatusTone::Error,
+        }
+    }
+
     pub(crate) fn page_label(&self) -> String {
         self.preview.page_label()
     }
@@ -948,15 +964,6 @@ impl App {
     pub(crate) fn render_preview(&mut self, area: Rect, buf: &mut Buffer) {
         self.preview.render(area, buf);
     }
-}
-
-fn contains(area: Rect, column: u16, row: u16) -> bool {
-    area.width > 0
-        && area.height > 0
-        && column >= area.x
-        && column < area.x.saturating_add(area.width)
-        && row >= area.y
-        && row < area.y.saturating_add(area.height)
 }
 
 fn spawn_terminal_reader(events: mpsc::Sender<LoopEvent>) {
@@ -993,7 +1000,7 @@ mod tests {
                 Picker::halfblocks(),
                 |_| PipelineLink::Recording(Vec::new()),
             );
-        app.configure_layout(Size::new(40, 20), Size::new(30, 20), Size::new(20, 8));
+        app.configure_layout(Rect::new(0, 0, 40, 20), Size::new(30, 20), Size::new(20, 8));
         app
     }
 
@@ -1107,6 +1114,8 @@ mod tests {
             Rect::new(40, 0, 30, 10),
             Rect::new(70, 0, 30, 10),
         );
+        // The text area right of the two-column gutter inside the source pane's border.
+        app.configure_layout(Rect::new(3, 1, 36, 8), Size::new(28, 8), Size::new(28, 8));
 
         app.handle_mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
@@ -1176,6 +1185,32 @@ mod tests {
         assert_eq!(revision, app.revision);
         assert!(source.contains("alpha"));
         assert!(matches!(app.status, PipelineStatus::Typesetting));
+    }
+
+    #[test]
+    fn a_build_older_than_the_last_sent_revision_is_dropped() {
+        let mut app = recording_app();
+        app.buffer.insert_str("alpha");
+        app.mark_edited();
+        let stale = app.revision;
+        let document = emit_latex(&Document::parse("alpha").expect("note parses"));
+
+        // Clearing the note sends the empty document without the worker; typing again starts a
+        // newer revision while the build of `stale` is still in flight.
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        app.buffer.insert_str("beta");
+        app.mark_edited();
+        app.handle_loop_event(LoopEvent::Worker(WorkerEvent::Built {
+            revision: stale,
+            document,
+            words: 1,
+        }));
+
+        assert!(!recorded(&app).iter().any(|command| matches!(
+            command,
+            PreviewCommand::Document { revision, .. } if *revision == stale
+        )));
+        assert!(!app.generated_body().contains("alpha"));
     }
 
     #[test]

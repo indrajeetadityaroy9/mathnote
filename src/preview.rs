@@ -46,7 +46,6 @@ pub(crate) enum PreviewEvent {
 }
 
 /// One page rendered for the preview pane.
-#[derive(Clone)]
 pub(crate) struct RenderedPage {
     pub index: usize,
     /// Pages the document has so far.
@@ -63,7 +62,7 @@ pub(crate) fn preview_thread(
 ) {
     let send = |event| events.send(LoopEvent::Preview(event)).is_ok();
     let cache_dir = default_cache_dir();
-    if !cache_is_warmed() && !send(PreviewEvent::Preparing) {
+    if !cache_is_warmed(&cache_dir) && !send(PreviewEvent::Preparing) {
         return;
     }
     let setup = ensure_cache_warm(&cache_dir)
@@ -78,7 +77,7 @@ pub(crate) fn preview_thread(
             // Snapshot every fresh engine at the end of the shared preamble, so even the first
             // edit after launch resumes there instead of typesetting from scratch.
             driver.set_root_snapshot(BODY_SNAPSHOT_OFFSET);
-            Ok((driver, FontStore::new(Box::new(files))))
+            Ok((driver, FontStore::new(files)))
         });
     let (driver, fonts) = match setup {
         Ok(setup) => setup,

@@ -5,7 +5,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
 
 use hayro::hayro_syntax::Pdf;
 use hayro::vello_cpu::color::palette::css::WHITE;
@@ -58,10 +57,7 @@ fn math_only_source() -> String {
 \[ \frac{\partial u}{\partial t} = \alpha \nabla u + \beta_{0} \]
 \[ e^{x_{i}^{2}} + 2^{-n^{-1}} + y^{a^{3}} \]
 ";
-    let latex = emit_latex(&Document::parse("").expect("empty note"));
-    latex
-        .source()
-        .replace(r"\end{document}", &format!("{body}\\end{{document}}"))
+    template("", body)
 }
 
 /// The verified cache, bootstrapped (or refilled after a schema change) first if needed.
@@ -167,9 +163,7 @@ fn parse(data: &[u8]) -> XdvDocument {
 }
 
 fn fonts() -> FontStore {
-    FontStore::new(Box::new(
-        BundleFontFiles::open(&warm_cache_dir()).expect("bundle opens"),
-    ))
+    FontStore::new(BundleFontFiles::open(&warm_cache_dir()).expect("bundle opens"))
 }
 
 fn fingerprints(document: &XdvDocument) -> Vec<u64> {
@@ -386,24 +380,6 @@ fn papersize_special_sets_the_page_size_in_big_points() {
             (page.height * 2.0).ceil() as u32
         )
     );
-}
-
-#[test]
-fn render_time_of_a_text_and_math_page() {
-    let document = parse(&xdv(&two_page_source()));
-    let page = document.page(0).unwrap();
-    let mut fonts = fonts();
-    let scale = WIDTH_PX as f32 / page.width;
-    let cold = Instant::now();
-    render_page(page, &mut fonts, scale);
-    let cold = cold.elapsed();
-    let runs = 10;
-    let warm = Instant::now();
-    for _ in 0..runs {
-        render_page(page, &mut fonts, scale);
-    }
-    let warm = warm.elapsed() / runs;
-    println!("page 0 at {WIDTH_PX} px: first render {cold:?}, then {warm:?} per render");
 }
 
 #[test]

@@ -1,12 +1,13 @@
 //! `TexDriver`: incremental typesetting of one primary document over snapshot engine processes.
 //!
 //! The driver runs `<engine_exe> --tex-engine <cache_dir>` (see [`crate::engine`]) and answers its
-//! queries over [`crate::protocol`]. Engine processes form a stack: the root and the `fork()`
-//! snapshots it and its descendants take while reading the document. Every observation of the
-//! document is recorded in a *trace*; an edit rolls back to the newest snapshot that has not seen
-//! the changed bytes, places *fences* just before the change so the resumed engine snapshots
-//! again right there, and truncates every output to the snapshot's mark.
+//! queries over a socket in the crate's wire protocol. Engine processes form a stack: the root and
+//! the `fork()` snapshots it and its descendants take while reading the document. Every
+//! observation of the document is recorded in a *trace*; an edit rolls back to the newest snapshot
+//! that has not seen the changed bytes, places *fences* just before the change so the resumed
+//! engine snapshots again right there, and truncates every output to the snapshot's mark.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
@@ -19,7 +20,7 @@ use nix::sys::signal::{Signal, kill};
 use nix::sys::socket::{AddressFamily, SockFlag, SockType, socketpair};
 use nix::unistd::Pid;
 
-use crate::engine::{PRIMARY_INPUT_NAME, STATUS_OUTPUT_NAME};
+use crate::engine::{PRIMARY_INPUT_NAME, STATUS_OUTPUT_NAME, XDV_OUTPUT_NAME};
 use crate::protocol::{
     Answer, DriverChannel, ENGINE_CHANNEL_FD, Q_SEEN, Query, QueryBody, STDOUT_FID, set_cloexec,
 };
@@ -34,14 +35,14 @@ const ENGINE_POLL: Duration = Duration::from_millis(10);
 const STUCK_AFTER: Duration = Duration::from_secs(1);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 
-const XDV_NAME: &str = "mathnote.xdv";
 const SYNCTEX_NAME: &str = "mathnote.synctex.gz";
 const LOG_NAME: &str = "mathnote.log";
 const STDOUT_NAME: &str = "stdout";
 
-/// `entry->seen` before any observation.
+/// [`Entry::seen`] of a file the engine has not looked at yet.
 const SEEN_UNSET: i64 = -1;
-/// `INT_MAX`: a lookup that failed.
+/// [`Entry::seen`] of a file the engine looked up and did not find. It is larger than any byte
+/// offset, so creating the file later rolls the engine back to before the lookup.
 const SEEN_MISSING: i64 = i32::MAX as i64;
 
 pub struct DriverConfig {
@@ -154,8 +155,8 @@ pub struct TexDriver {
     processes: Vec<Process>,
     roots: Vec<Child>,
     trace: Vec<TraceEntry>,
-    fences: [Fence; MAX_FENCES],
-    fence_pos: i32,
+    /// Pending fences, a stack whose top is the earliest position.
+    fences: Vec<Fence>,
     transaction: Option<Transaction>,
     verification: Option<Verification>,
     xdv_truncation: Option<usize>,
@@ -180,11 +181,7 @@ impl TexDriver {
             processes: Vec::new(),
             roots: Vec::new(),
             trace: Vec::new(),
-            fences: [Fence {
-                entry: PRIMARY,
-                position: 0,
-            }; MAX_FENCES],
-            fence_pos: -1,
+            fences: Vec::with_capacity(MAX_FENCES),
             transaction: None,
             verification: None,
             xdv_truncation: None,
@@ -239,10 +236,22 @@ impl TexDriver {
     fn apply_change(&mut self, entry: usize, changed: i64) {
         self.rollback_begin();
         self.rollback_add_change(entry, changed);
+        self.rollback_commit();
+    }
+
+    /// Close the change transaction; place fences and roll the processes back when it needs it.
+    fn rollback_commit(&mut self) {
         if let Some((reverted, offset)) = self.rollback_end() {
             let trace = self.compute_fences(reverted, offset);
             self.rollback_processes(reverted, trace);
         }
+    }
+
+    /// Kill the top process, presumed stuck in an endless computation; it is not resumed.
+    fn kill_top(&mut self) {
+        let top = self.top();
+        self.close_process(top);
+        self.processes[top].killed = true;
     }
 
     /// A deferred change whose process then stays silent for [`STUCK_AFTER`] kills that
@@ -264,19 +273,13 @@ impl TexDriver {
             return;
         }
         self.verification = None;
-        // Same steps as the kill in `process_pending_messages`, inside a change transaction.
         self.rollback_begin();
-        let top = self.top();
-        self.close_process(top);
-        self.processes[top].killed = true;
+        self.kill_top();
         if let Some(transaction) = self.transaction.as_mut() {
             transaction.flush = true;
         }
         self.rollback_add_change(pending.entry, pending.changed);
-        if let Some((reverted, offset)) = self.rollback_end() {
-            let trace = self.compute_fences(reverted, offset);
-            self.rollback_processes(reverted, trace);
-        }
+        self.rollback_commit();
     }
 
     /// The pending verification, if it still belongs to the live top process.
@@ -293,7 +296,6 @@ impl TexDriver {
         self.reap();
         while self.document.is_some() {
             if self.processes.is_empty() {
-                // engine_step(restart_if_needed = true) → prepare_process.
                 self.prepare_process();
                 changed = true;
             }
@@ -325,7 +327,8 @@ impl TexDriver {
     }
 
     pub fn xdv(&self) -> &[u8] {
-        self.output(XDV_NAME).map_or(&[], |entry| &entry.data)
+        self.output(XDV_OUTPUT_NAME)
+            .map_or(&[], |entry| &entry.data)
     }
 
     pub fn take_xdv_truncation(&mut self) -> Option<usize> {
@@ -347,10 +350,7 @@ impl TexDriver {
                 tex_line: None,
             });
         }
-        let status = self
-            .output(STATUS_OUTPUT_NAME)
-            .map(|entry| String::from_utf8_lossy(&entry.data).into_owned())
-            .unwrap_or_default();
+        let status = self.output_text(STATUS_OUTPUT_NAME);
         for line in status.lines() {
             let Some((kind, message)) = line.split_once('\t') else {
                 continue;
@@ -369,10 +369,7 @@ impl TexDriver {
             });
         }
 
-        let log = self
-            .output(LOG_NAME)
-            .map(|entry| String::from_utf8_lossy(&entry.data).into_owned())
-            .unwrap_or_default();
+        let log = self.output_text(LOG_NAME);
         let mut log_errors = log_error_pairs(&log).into_iter();
         let mut any_error = false;
         for message in messages.iter_mut().filter(|message| message.error) {
@@ -402,6 +399,13 @@ impl TexDriver {
 
     fn output(&self, name: &str) -> Option<&Entry> {
         self.names.get(name).map(|&index| &self.entries[index])
+    }
+
+    /// The output `name` as text; empty when it was never written.
+    fn output_text(&self, name: &str) -> Cow<'_, str> {
+        self.output(name).map_or(Cow::Borrowed(""), |entry| {
+            String::from_utf8_lossy(&entry.data)
+        })
     }
 
     /// Index of the entry for `path`, created on first use.
@@ -436,7 +440,7 @@ impl TexDriver {
     /// and dropped.
     fn log_rollback(&mut self, mark: &Mark) {
         self.cells = mark.cells.clone();
-        let xdv = self.names.get(XDV_NAME).copied();
+        let xdv = self.names.get(XDV_OUTPUT_NAME).copied();
         for (index, entry) in self.entries.iter_mut().enumerate() {
             let (buffer, len, state) =
                 mark.outputs
@@ -461,7 +465,7 @@ impl TexDriver {
     fn open_output(&mut self, entry: usize) {
         let buffer = self.next_buffer;
         self.next_buffer += 1;
-        let is_xdv = self.names.get(XDV_NAME) == Some(&entry);
+        let is_xdv = self.names.get(XDV_OUTPUT_NAME) == Some(&entry);
         let entry = &mut self.entries[entry];
         if entry.buffer != 0 {
             let old = std::mem::take(&mut entry.data);
@@ -481,17 +485,14 @@ impl TexDriver {
         self.processes.len() - 1
     }
 
-    /// Start the root engine process when the stack is empty.
+    /// Start the root engine process.
     fn prepare_process(&mut self) {
-        if !self.processes.is_empty() {
-            return;
-        }
         self.log_rollback(&Mark::default());
         self.retired.clear();
         self.spawn_error = None;
         self.stats.roots_spawned += 1;
         let (pid, chan) = match self.spawn_root() {
-            Ok(spawned) => spawned,
+            Ok((pid, chan)) => (pid, Some(chan)),
             Err(error) => {
                 self.spawn_error = Some(format!("could not start the TeX engine: {error}"));
                 (0, None)
@@ -511,19 +512,21 @@ impl TexDriver {
     }
 
     /// Fence the fresh root at `offset`, before any fences already placed nearer a change.
-    /// Fences form a stack whose top (`fence_pos`) is the earliest position, read first.
+    /// Fences form a stack whose top (last element) is the earliest position, read first.
     fn add_root_fence(&mut self, offset: i64) {
-        let earliest = self.fence_pos < 0 || self.fences[self.fence_pos as usize].position > offset;
-        if earliest && self.fence_pos < MAX_FENCES as i32 - 1 {
-            self.fence_pos += 1;
-            self.fences[self.fence_pos as usize] = Fence {
+        let earliest = self
+            .fences
+            .last()
+            .is_none_or(|fence| fence.position > offset);
+        if earliest && self.fences.len() < MAX_FENCES {
+            self.fences.push(Fence {
                 entry: PRIMARY,
                 position: offset,
-            };
+            });
         }
     }
 
-    fn spawn_root(&mut self) -> std::io::Result<(i32, Option<DriverChannel>)> {
+    fn spawn_root(&mut self) -> std::io::Result<(i32, DriverChannel)> {
         let (driver_end, engine_end) = socketpair(
             AddressFamily::Unix,
             SockType::Stream,
@@ -561,7 +564,7 @@ impl TexDriver {
         self.roots.push(child);
         let mut chan = DriverChannel::new(driver_end);
         match chan.handshake(HANDSHAKE_TIMEOUT) {
-            Ok(()) => Ok((pid, Some(chan))),
+            Ok(()) => Ok((pid, chan)),
             Err(error) => {
                 let _ = kill(Pid::from_raw(pid), Signal::SIGTERM);
                 Err(error)
@@ -682,7 +685,7 @@ impl TexDriver {
     /// Whether to answer the next read with `FORK`: once 500 ms of engine time have passed since
     /// the last snapshot, and never while fences are pending.
     fn need_snapshot(&self, time: u32) -> bool {
-        if self.fence_pos != -1 {
+        if !self.fences.is_empty() {
             return false;
         }
         let process = self.top();
@@ -766,18 +769,18 @@ impl TexDriver {
                 }
                 let mut n = i64::from(size).min(data_len - pos);
                 let mut fork = false;
-                if self.fence_pos >= 0 {
-                    let fence = self.fences[self.fence_pos as usize];
-                    if fence.entry == entry && fence.position < pos + n {
-                        n = fence.position - pos;
-                        if n < 0 {
-                            return Err(Violation);
-                        }
-                        fork = n == 0;
+                if let Some(fence) = self.fences.last().copied()
+                    && fence.entry == entry
+                    && fence.position < pos + n
+                {
+                    n = fence.position - pos;
+                    if n < 0 {
+                        return Err(Violation);
                     }
+                    fork = n == 0;
                 }
                 if fork {
-                    self.fence_pos -= 1;
+                    self.fences.pop();
                     Answer::Fork
                 } else if self.need_snapshot(time) {
                     Answer::Fork
@@ -938,15 +941,13 @@ impl TexDriver {
     /// Place fences before the change at `offset`; returns the trace position processes roll
     /// back to (may be -1).
     fn compute_fences(&mut self, trace: usize, offset: i64) -> i64 {
-        self.fence_pos = -1;
+        self.fences.clear();
         if trace == 0 {
             return 0;
         }
         if self.processes[self.top()].trace_len <= trace {
             return trace as i64;
         }
-        self.fence_pos = 0;
-
         let mut offset = (offset - 64) & !63;
         if offset < self.trace[trace].seen {
             offset = self.trace[trace].seen;
@@ -954,10 +955,10 @@ impl TexDriver {
         if offset == -1 {
             offset = 0;
         }
-        self.fences[0] = Fence {
+        self.fences.push(Fence {
             entry: self.trace[trace].entry,
             position: offset,
-        };
+        });
 
         let mut delta = 50i64;
         let mut time = i64::from(self.trace[trace].time) - 10;
@@ -968,14 +969,13 @@ impl TexDriver {
             .find(|process| process.trace_len <= trace)
             .map_or(-1, |process| process.trace_len as i64);
         let mut trace = trace as i64;
-        while trace > target_trace && self.fence_pos < (MAX_FENCES - 1) as i32 {
+        while trace > target_trace && self.fences.len() < MAX_FENCES {
             let entry = self.trace[trace as usize];
             if i64::from(entry.time) <= time && self.possible_fence(&entry) {
-                self.fence_pos += 1;
-                self.fences[self.fence_pos as usize] = Fence {
+                self.fences.push(Fence {
                     entry: entry.entry,
                     position: entry.seen.max(0),
-                };
+                });
                 time -= delta;
                 delta *= 2;
             }
@@ -1027,9 +1027,7 @@ impl TexDriver {
             .is_some_and(|chan| chan.has_pending(Duration::ZERO));
         if !pending {
             if self.processes[top].last_heard.elapsed() >= STUCK_AFTER {
-                // Possibly stuck in an endless computation; resume from the previous snapshot.
-                self.close_process(top);
-                self.processes[top].killed = true;
+                self.kill_top();
             } else {
                 self.verification = Some(Verification {
                     pid: self.processes[top].pid,
@@ -1164,6 +1162,15 @@ fn unescape_status(message: &str) -> String {
     out
 }
 
+/// The decimal number at the start of `text`, if any.
+fn leading_number(text: &str) -> Option<usize> {
+    let end = text
+        .bytes()
+        .position(|byte| !byte.is_ascii_digit())
+        .unwrap_or(text.len());
+    text[..end].parse().ok()
+}
+
 /// `! message` lines of a TeX log with the `l.<n>` context line that follows them.
 fn log_error_pairs(log: &str) -> Vec<(String, Option<usize>)> {
     let mut pairs: Vec<(String, Option<usize>)> = Vec::new();
@@ -1174,36 +1181,19 @@ fn log_error_pairs(log: &str) -> Vec<(String, Option<usize>)> {
             && let Some(last) = pairs.last_mut()
             && last.1.is_none()
         {
-            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
-            last.1 = digits.parse().ok();
+            last.1 = leading_number(rest);
         }
     }
     pairs
 }
 
-/// A `mathnote.tex:<n>:` prefix, else an `l.<n>` context line (copy of the worker's logic).
+/// A `mathnote.tex:<n>:` prefix, else an `l.<n>` context line.
 fn extract_tex_line(log: &str) -> Option<usize> {
-    let mut remainder = log;
-    while let Some(index) = remainder.find("mathnote.tex:") {
-        remainder = &remainder[index + "mathnote.tex:".len()..];
-        let digits: String = remainder
-            .chars()
-            .take_while(|character| character.is_ascii_digit())
-            .collect();
-        if let Ok(line) = digits.parse() {
-            return Some(line);
-        }
-    }
-
-    for marker in ["\nl.", " l."] {
+    for (marker, separator) in [(PRIMARY_INPUT_NAME, ":"), ("\nl.", ""), (" l.", "")] {
         let mut remainder = log;
         while let Some(index) = remainder.find(marker) {
             remainder = &remainder[index + marker.len()..];
-            let digits: String = remainder
-                .chars()
-                .take_while(|character| character.is_ascii_digit())
-                .collect();
-            if let Ok(line) = digits.parse() {
+            if let Some(line) = remainder.strip_prefix(separator).and_then(leading_number) {
                 return Some(line);
             }
         }

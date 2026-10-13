@@ -25,7 +25,6 @@ pub(crate) fn split(area: Rect, focus: PaneFocus) -> PaneAreas {
     let (source, latex, preview) = constraints(focus);
     let panes = Layout::default()
         .direction(direction)
-        .spacing(0)
         .constraints([source, latex, preview])
         .split(area);
     PaneAreas {

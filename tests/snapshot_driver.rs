@@ -1,19 +1,12 @@
 use std::time::{Duration, Instant};
 
-use mathnote::cache::{default_cache_dir, ensure_cache_warm};
+mod common;
+
+use common::driver;
 use mathnote::document::Document;
-use mathnote::driver::{DriverConfig, EngineState, TexDriver};
+use mathnote::driver::{EngineState, TexDriver};
 use mathnote::latex::{BODY_SNAPSHOT_OFFSET, LatexDocument, emit_latex};
 use mathnote::synctex::SyncIndex;
-
-fn driver() -> TexDriver {
-    let cache_dir = default_cache_dir();
-    ensure_cache_warm(&cache_dir).expect("warm Tectonic cache");
-    TexDriver::new(DriverConfig {
-        engine_exe: env!("CARGO_BIN_EXE_mathnote").into(),
-        cache_dir,
-    })
-}
 
 fn latex(note: &str) -> LatexDocument {
     emit_latex(&Document::parse(note).expect("note parses"))
