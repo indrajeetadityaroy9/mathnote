@@ -67,4 +67,4 @@ cargo clippy --all-targets
 cargo bench --bench latency
 ```
 
-The tests typeset real documents, so the first run needs network access to fill the resource cache. The tests compare mathnote's page renderer with Tectonic's own PDF output, so they build Tectonic's full pipeline as a dev-dependency; the editor itself does not. The `latency` benchmark types a note one character at a time and reports typeset time per edit, page render time, preview update time, and the terminal bytes each edit sends. Planned work is tracked in [ROADMAP.md](ROADMAP.md).
+The tests typeset real documents, so the first run needs network access to fill the resource cache. The tests compare mathnote's page renderer with Tectonic's own PDF output, so they build Tectonic's full pipeline as a dev-dependency; the editor itself does not. The `latency` benchmark types a note one character at a time and reports typeset time per edit, page render time, preview update time, and the terminal bytes each edit sends.
